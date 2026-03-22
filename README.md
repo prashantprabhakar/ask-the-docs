@@ -1,8 +1,8 @@
 # Ask the Docs
 
-A learning project to understand **Retrieval-Augmented Generation (RAG)** from scratch — no vector DB servers, no frameworks hiding the details. Ask questions about Next.js documentation and get streamed, cited answers.
+A learning project to understand **Retrieval-Augmented Generation (RAG)** by building it from scratch — no frameworks hiding the details. Ask questions about Next.js documentation and get streamed, cited answers with multi-turn conversation support.
 
-> Built with Next.js 16, Ollama (local), and a hand-rolled file-based vector store.
+> Built with Next.js 16, Qdrant (local vector DB), Ollama (local LLM), and a hand-rolled hybrid search pipeline.
 
 ---
 
@@ -10,54 +10,55 @@ A learning project to understand **Retrieval-Augmented Generation (RAG)** from s
 
 Type a question like *"How does the App Router handle layouts?"* and the app:
 
-1. Embeds your question into a vector using a local embedding model
-2. Finds the most semantically similar chunks from the Next.js docs
-3. Sends those chunks as context to an LLM with a grounded prompt
-4. Streams the answer back token by token with source citations
+1. Embeds your question using a local embedding model
+2. Runs hybrid search — dense (semantic) + sparse (keyword) — against the Qdrant vector store
+3. Fuses the two result lists with Reciprocal Rank Fusion (RRF)
+4. Sends the top chunks as context to an LLM with a grounded prompt
+5. Streams the answer back token by token with source citations
 
-No hallucinations from training data — the LLM only answers from what the docs actually say.
+Follow-up questions work too — conversation history is included in every prompt so the LLM understands what has already been discussed.
 
 ---
 
-## How RAG works here
+## How the pipeline works
 
-RAG has two distinct phases:
-
-### Phase 1 — Ingest (run once, offline)
+### Phase 1 — Fetch (run once, or when you want fresh docs)
 
 ```
-docs/*.md → chunk → embed → vector-store.json
+GitHub tarball → stream → extract docs/ → data/docs/
 ```
 
-**Step 1: Load** — [`lib/rag/ingester.ts`](lib/rag/ingester.ts) walks `data/docs/` and reads every `.md` / `.mdx` file. The first `#` heading becomes the document title used in citations.
+`npm run fetch-docs` streams the Next.js repo tarball from GitHub and extracts only the `docs/` folder. No API rate limits — one HTTP request, not one per file.
 
-**Step 2: Chunk** — [`lib/rag/chunker.ts`](lib/rag/chunker.ts) splits each document using `RecursiveCharacterTextSplitter` (1500 chars, 200 char overlap). The overlap is the key insight: if an answer straddles a chunk boundary, at least one chunk will contain the full relevant passage.
-
-**Step 3: Embed** — Each chunk is passed to an embedding model (Ollama's `nomic-embed-text` or OpenAI's `text-embedding-3-small`). This converts text into a high-dimensional vector that encodes semantic meaning.
-
-**Step 4: Store** — [`lib/vectordb/vector-store.ts`](lib/vectordb/vector-store.ts) persists chunks + embeddings to `data/vector-store.json`. Chunks get deterministic MD5 IDs so re-running ingest is safe (upsert, not duplicate).
-
-### Phase 2 — Query (on every user question)
+### Phase 2 — Ingest (run after fetch, or when docs change)
 
 ```
-question → embed → similarity search → prompt → LLM → stream
+data/docs/ → chunk → embed → sparse encode → Qdrant
 ```
 
-**Retrieve** — The question is embedded with the same model used during ingest (same semantic space = comparable vectors). Cosine similarity is computed against every stored chunk. Only chunks scoring above 0.6 are considered.
+**Chunk** — [`lib/rag/chunker.ts`](lib/rag/chunker.ts) splits each file on Markdown headings (`##`, `###`) first so each chunk maps to a meaningful section. Large sections are sub-split by character count. Each chunk carries its full heading path (`App Router > Layouts > Nested Layouts`) for citations.
 
-**Augment** — The top-5 chunks are injected into a system prompt: *"Answer ONLY using the provided context."* This is the "augmented" part of RAG — giving the LLM private knowledge it wasn't trained on.
+**Embed** — Each chunk is passed to an embedding model to produce a dense vector encoding its meaning.
 
-**Generate** — [`lib/rag/retriever.ts`](lib/rag/retriever.ts) sends the prompt to the LLM and returns an async token stream. The API route ([`app/api/chat/route.ts`](app/api/chat/route.ts)) forwards this as Server-Sent Events (SSE) to the browser, which renders tokens as they arrive.
+**Sparse encode** — [`lib/rag/sparse-encoder.ts`](lib/rag/sparse-encoder.ts) computes a TF-weighted sparse vector for keyword matching.
 
-### The vector math
+**Store** — Both vectors are upserted into Qdrant under the same point. Chunk IDs are deterministic UUID v5 derived from source path + content, so re-ingesting unchanged content is a no-op.
 
-Cosine similarity measures the angle between two vectors in embedding space:
+**Incremental** — [`lib/rag/ingest-cache.ts`](lib/rag/ingest-cache.ts) hashes each file's content. Unchanged files are skipped entirely. Changed files have their old chunks deleted before new ones are upserted.
+
+### Phase 3 — Query (on every user question)
 
 ```
-similarity = dot(A, B) / (|A| × |B|)
+question → embed + sparse encode → hybrid search → RRF → score filter → prompt → LLM → stream
 ```
 
-Score near **1.0** → semantically identical. Score near **0.0** → unrelated. This works because the embedding model places semantically similar text in nearby directions regardless of exact wording.
+**Retrieve** — The question is embedded (dense) and sparse-encoded (keyword). Qdrant runs both searches in parallel, then fuses the ranked results with RRF.
+
+**Filter** — Chunks below the minimum score threshold are dropped. If nothing passes, the app returns "I couldn't find relevant information" rather than hallucinating from noise.
+
+**Augment** — The surviving chunks are injected into the prompt alongside the last 3 turns of conversation history.
+
+**Generate** — The LLM streams its answer. The API route forwards tokens as Server-Sent Events (SSE) so the UI renders them as they arrive.
 
 ---
 
@@ -65,29 +66,35 @@ Score near **1.0** → semantically identical. Score near **0.0** → unrelated.
 
 ```
 app/
-  page.tsx              # Chat UI (streaming SSE consumer)
-  api/chat/route.ts     # POST /api/chat — SSE endpoint
+  page.tsx                  # Chat UI — streaming SSE consumer, maintains history
+  api/chat/route.ts         # POST /api/chat — SSE endpoint, accepts history[]
 
 lib/
   rag/
-    ingester.ts         # Load docs, orchestrate ingest pipeline
-    chunker.ts          # Split docs into overlapping chunks
-    retriever.ts        # Embed query, search, build prompt, stream
+    chunker.ts              # Structure-aware section splitting
+    ingester.ts             # Ingest pipeline — walk, chunk, embed, store
+    ingest-cache.ts         # File-hash cache for incremental ingestion
+    retriever.ts            # Embed query, hybrid search, filter, prompt, stream
+    sparse-encoder.ts       # TF-based sparse vector encoder
   vectordb/
-    vector-store.ts     # File-based store with cosine similarity
+    qdrant.client.ts        # Qdrant client — upsert, hybrid search, delete
+    index.ts                # Re-exports public API
   llm/
-    factory.ts          # Create LLM/embedding clients from env vars
-    ollama.client.ts    # Ollama (local) implementation
-    openai.client.ts    # OpenAI / GitHub Models implementation
-    types.ts            # ILLMClient / IEmbeddingClient interfaces
+    factory.ts              # Create LLM/embedding clients from env vars
+    ollama.client.ts        # Ollama (local) implementation
+    openai.client.ts        # OpenAI implementation
+    types.ts                # ILLMClient / IEmbeddingClient interfaces
 
 scripts/
-  fetch-docs.ts         # CLI entry point: npm run fetch-docs
-  ingest.ts             # CLI entry point: npm run ingest
+  fetch-docs.ts             # npm run fetch-docs — pull docs from GitHub
+  ingest.ts                 # npm run ingest — chunk, embed, store
+
+docs/
+  concepts-and-decisions.md # Explains every concept and design decision in depth
 
 data/
-  docs/                 # Generated — Next.js docs fetched from GitHub (gitignored)
-  ingest-cache.json     # Generated — file hashes for incremental ingest (gitignored)
+  docs/                     # Generated by fetch-docs (gitignored)
+  ingest-cache.json         # Generated by ingest (gitignored)
 ```
 
 ---
@@ -97,7 +104,11 @@ data/
 ### Prerequisites
 
 - [Node.js](https://nodejs.org) 18+
-- [Ollama](https://ollama.com) running locally (default), **or** an OpenAI / GitHub Models API key
+- [Qdrant](https://qdrant.tech) running locally — download the binary or use Docker:
+  ```bash
+  docker run -p 6333:6333 qdrant/qdrant
+  ```
+- [Ollama](https://ollama.com) running locally (default), **or** an OpenAI API key
 
 ### 1. Install dependencies
 
@@ -126,6 +137,7 @@ EMBEDDING_PROVIDER=openai
 OPENAI_API_KEY=sk-...
 LLM_MODEL=gpt-4o-mini
 EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_DIM=1536
 ```
 
 ### 3. Fetch the docs
@@ -134,7 +146,7 @@ EMBEDDING_MODEL=text-embedding-3-small
 npm run fetch-docs
 ```
 
-Downloads the Next.js documentation from the official GitHub repository into `data/docs/`. This must run before ingest. Re-run it whenever you want to pull the latest docs.
+Streams the Next.js documentation from GitHub into `data/docs/`. Re-run whenever you want the latest docs.
 
 ### 4. Ingest the docs
 
@@ -142,9 +154,9 @@ Downloads the Next.js documentation from the official GitHub repository into `da
 npm run ingest
 ```
 
-Chunks, embeds, and stores everything in Qdrant. Only needs to run once (or after fetching updated docs).
+Chunks, embeds, and stores everything in Qdrant. Only re-runs work for changed files.
 
-To force a full re-embed from scratch (e.g. after switching embedding models):
+To force a full re-embed from scratch (required after switching embedding models — old vectors are incompatible):
 
 ```bash
 npm run ingest:full
@@ -160,27 +172,6 @@ Open [http://localhost:3000](http://localhost:3000).
 
 ---
 
-## What could be improved
+## Want to understand the concepts?
 
-This project intentionally keeps things simple for learning. Here's what a production RAG system would add:
-
-| Area | Current | Production alternative |
-|------|---------|----------------------|
-| **Vector store** | Flat JSON file, brute-force cosine scan | Chroma, Pgvector, Pinecone, Weaviate — indexed with HNSW for sub-millisecond search at millions of vectors |
-| **Retrieval quality** | Embedding similarity only | Hybrid search: BM25 (keyword) + semantic, then re-rank with a cross-encoder |
-| **Chunking** | Fixed character size with overlap | Semantic chunking (split on meaning, not length), or document-aware parsing that respects headings/code blocks |
-| **Query understanding** | Raw question embedded as-is | HyDE (embed a hypothetical answer instead of the question), query expansion, or multi-query retrieval |
-| **Context window** | Top-5 chunks concatenated | Re-ranking to fit more relevant content, or map-reduce for large doc sets |
-| **Conversation** | Single-turn only | Multi-turn with history compression, so follow-up questions retain context |
-| **Evaluation** | None | RAGAS, TruLens, or custom metrics (faithfulness, answer relevance, context precision) |
-| **Freshness** | Manual re-ingest | Incremental updates tracked by file hash, webhook-triggered re-ingestion |
-
----
-
-## Key concepts to take away
-
-- **Embedding** turns text into a point in high-dimensional space. Nearby points = similar meaning.
-- **Chunking with overlap** ensures answers that straddle boundaries are still retrievable.
-- **The 0.6 score threshold** filters irrelevant chunks before they pollute the prompt — tune this for your domain.
-- **Grounded prompting** ("answer ONLY from context") is what prevents hallucination; without it, the LLM falls back on training data.
-- **SSE streaming** lets the UI feel responsive while the LLM generates — the sources are sent first as a separate event, then tokens follow.
+See [`docs/concepts-and-decisions.md`](docs/concepts-and-decisions.md) for detailed explanations of every design decision — why Qdrant over FAISS/Chroma/Pinecone, what TF/IDF/BM25/RRF actually mean with worked examples, how the sparse encoder works step by step, why structural chunking beats character chunking, and more.
