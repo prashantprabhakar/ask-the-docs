@@ -42,6 +42,10 @@ export default function Home() {
     setInput('')
     setLoading(true)
 
+    // Capture history before adding the new messages — these are the prior turns
+    // the server needs for context. Strip sources (UI-only) down to role + content.
+    const history = messages.map(({ role, content }) => ({ role, content }))
+
     setMessages((prev) => [...prev, { role: 'user', content: question }])
     setMessages((prev) => [...prev, { role: 'assistant', content: '', sources: [] }])
 
@@ -49,7 +53,7 @@ export default function Home() {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({ question, history }),
       })
 
       const reader = res.body!.getReader()

@@ -445,10 +445,62 @@ something that has no answer in the documentation, the search still returns the 
 chunks. An LLM given irrelevant context will hallucinate — it will construct a plausible-sounding
 answer from the noise.
 
-Filtering results below a minimum score (e.g. 0.30) gives the system a way to say "nothing is
-relevant" and return an honest "I couldn't find that in the documentation" instead.
+Filtering results below a minimum score gives the system a way to say "nothing is relevant" and
+return an honest "I couldn't find that in the documentation" instead.
+
+**One important nuance with RRF scores:** RRF scores are not cosine similarities. They are
+rank-derived and typically fall in a much smaller range (0.01–0.05) rather than 0 to 1. So a
+threshold of 0.30 (which would be sensible for cosine similarity) would reject everything. The
+threshold must be calibrated against your actual score distributions by running representative
+queries and observing the numbers.
 
 The threshold value is empirical. You set it by running a set of known-irrelevant queries,
 looking at what scores they produce, and picking a cutoff that rejects them reliably without
 cutting off legitimate low-confidence results. There is no universal right answer — it depends
-on your embedding model and your documents.
+on your embedding model, your sparse encoder, and your documents.
+
+---
+
+## Conversation history — how multi-turn Q&A works
+
+By default, each question is independent. The LLM sees only the retrieved context and the
+current question. A follow-up like "how do I use that with TypeScript?" has no "that" to refer
+to — the LLM has no memory of what was discussed.
+
+The fix is to pass the prior conversation turns to the LLM alongside the new question.
+
+**How it is structured in the prompt:**
+
+```
+system:    You are a helpful assistant...
+user:      [turn 1 question]
+assistant: [turn 1 answer]
+user:      [turn 2 question]
+assistant: [turn 2 answer]
+user:      Context from the documentation:
+           {retrieved chunks}
+           ---
+           Question: {current question}
+```
+
+The history comes *before* the retrieved context so the LLM first understands what has already
+been discussed, then reads the new evidence, then answers.
+
+**Why cap history at N turns?**
+
+Every turn you add to the prompt costs tokens — which costs money (on paid APIs) and increases
+latency. More importantly, LLMs have a context window limit. A long conversation would
+eventually exceed it. We cap at the last 3 turns (6 messages: 3 user + 3 assistant), which is
+enough for natural follow-up questions without bloating the prompt.
+
+**Why not summarize old turns instead of truncating?**
+
+Summarization is better but requires an extra LLM call before every query. For a learning
+project the truncation approach is the right tradeoff. In production you would summarize old
+turns progressively so early context is not lost entirely.
+
+**What history is sent from the frontend?**
+
+The frontend strips the `sources` field (which is UI-only metadata) before sending, keeping
+only `role` and `content` per message. The server receives a clean `Message[]` that matches
+the LLM's expected format directly.
