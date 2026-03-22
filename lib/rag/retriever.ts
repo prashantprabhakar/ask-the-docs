@@ -1,5 +1,6 @@
 import { createEmbeddingClient, createLLMClient } from '../llm/factory'
 import { similaritySearch } from '../vectordb'
+import { encodeSparse } from './sparse-encoder'
 import type { Message } from '../llm/types'
 
 const embedder = createEmbeddingClient()
@@ -55,7 +56,8 @@ Question: ${question}`,
 export async function ragQuery(question: string): Promise<RAGResponse> {
   // Step 1: RETRIEVE — embed the question and search for similar chunks
   const queryEmbedding = await embedder.embed(question)
-  const results = await similaritySearch(queryEmbedding, 5)
+  const querySparse = encodeSparse(question)
+  const results = await similaritySearch(queryEmbedding, querySparse, 5)
 
   if (results.length === 0) {
     return {
@@ -94,7 +96,8 @@ export async function ragQueryStream(question: string): Promise<{
   sources: RetrievedSource[]
 }> {
   const queryEmbedding = await embedder.embed(question)
-  const results = await similaritySearch(queryEmbedding, 5)
+  const querySparse = encodeSparse(question)
+  const results = await similaritySearch(queryEmbedding, querySparse, 5)
 
   const messages = buildPrompt(
     question,

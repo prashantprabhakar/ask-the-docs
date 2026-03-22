@@ -3,6 +3,7 @@ import path from 'path'
 import { createEmbeddingClient } from '../llm/factory'
 import { chunkDocument } from './chunker'
 import { upsertChunks, chunkId, deleteChunksBySource } from '../vectordb'
+import { encodeSparse } from './sparse-encoder'
 import { loadCache, saveCache, hashFileContent } from './ingest-cache'
 import type { RawDocument } from './chunker'
 import type { DocChunk } from '../vectordb'
@@ -84,6 +85,7 @@ async function embedAndStore(doc: RawDocument): Promise<number> {
       id: chunkId(chunk.source, chunk.content),
       content: chunk.content,
       embedding: embeddings[j],
+      sparseVector: encodeSparse(chunk.content),
       metadata: {
         source: chunk.source,
         title: chunk.title,
