@@ -1,65 +1,196 @@
-import Image from "next/image";
+'use client'
+
+import { useState, useRef, useEffect, useCallback } from 'react'
+
+interface Source {
+  title: string
+  source: string
+  score: number
+  excerpt: string
+}
+
+interface Message {
+  role: 'user' | 'assistant'
+  content: string
+  sources?: Source[]
+}
 
 export default function Home() {
+  const [messages, setMessages] = useState<Message[]>([])
+  const [input, setInput] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [expandedSources, setExpandedSources] = useState<Set<number>>(new Set())
+  const bottomRef = useRef<HTMLDivElement>(null)
+
+  const toggleSources = useCallback((index: number) => {
+    setExpandedSources((prev) => {
+      const next = new Set(prev)
+      next.has(index) ? next.delete(index) : next.add(index)
+      return next
+    })
+  }, [])
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
+
+  async function sendMessage(e: React.FormEvent) {
+    e.preventDefault()
+    if (!input.trim() || loading) return
+
+    const question = input.trim()
+    setInput('')
+    setLoading(true)
+
+    setMessages((prev) => [...prev, { role: 'user', content: question }])
+    setMessages((prev) => [...prev, { role: 'assistant', content: '', sources: [] }])
+
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question }),
+      })
+
+      const reader = res.body!.getReader()
+      const decoder = new TextDecoder()
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        const lines = decoder.decode(value).split('\n')
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const data = line.slice(6)
+          if (data === '[DONE]') break
+
+          const parsed = JSON.parse(data)
+
+          if (parsed.type === 'sources') {
+            setMessages((prev) => {
+              const updated = [...prev]
+              updated[updated.length - 1] = { ...updated[updated.length - 1], sources: parsed.sources }
+              return updated
+            })
+          }
+
+          if (parsed.type === 'token') {
+            setMessages((prev) => {
+              const updated = [...prev]
+              updated[updated.length - 1] = {
+                ...updated[updated.length - 1],
+                content: updated[updated.length - 1].content + parsed.token,
+              }
+              return updated
+            })
+          }
+        }
+      }
+    } catch {
+      setMessages((prev) => {
+        const updated = [...prev]
+        updated[updated.length - 1] = {
+          ...updated[updated.length - 1],
+          content: 'Something went wrong. Is Ollama running?',
+        }
+        return updated
+      })
+    } finally {
+      setLoading(false)
+    }
+  }
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+    <div className="flex flex-col h-screen bg-gray-950 text-gray-100">
+      <header className="border-b border-gray-800 px-6 py-4">
+        <h1 className="text-xl font-semibold">Ask the Docs</h1>
+        <p className="text-sm text-gray-400">Next.js documentation — powered by RAG + Ollama</p>
+      </header>
+
+      <div className="flex-1 overflow-y-auto px-4 py-6 space-y-6 max-w-3xl mx-auto w-full">
+        {messages.length === 0 && (
+          <div className="text-center text-gray-500 mt-20 space-y-2">
+            <p className="text-lg">Ask anything about Next.js</p>
+            <p className="text-sm">&quot;How does the App Router handle layouts?&quot;</p>
+            <p className="text-sm">&quot;What is server-side rendering in Next.js?&quot;</p>
+            <p className="text-sm">&quot;How do I use useRouter in the app directory?&quot;</p>
+          </div>
+        )}
+
+        {messages.map((msg, i) => (
+          <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+            <div className={`max-w-2xl ${msg.role === 'user' ? 'w-auto' : 'w-full'}`}>
+              <div
+                className={`rounded-2xl px-4 py-3 whitespace-pre-wrap text-sm leading-relaxed ${
+                  msg.role === 'user'
+                    ? 'bg-blue-600 text-white inline-block'
+                    : 'bg-gray-800 text-gray-100 w-full'
+                }`}
+              >
+                {msg.content || (loading && i === messages.length - 1
+                  ? <span className="animate-pulse text-gray-400">Thinking...</span>
+                  : null
+                )}
+              </div>
+
+              {msg.sources && msg.sources.length > 0 && (
+                <div className="mt-2">
+                  <button
+                    onClick={() => toggleSources(i)}
+                    className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-300 transition-colors py-1"
+                  >
+                    <svg
+                      className={`w-3 h-3 transition-transform duration-200 ${expandedSources.has(i) ? 'rotate-90' : ''}`}
+                      fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                    </svg>
+                    {msg.sources.length} sources used
+                  </button>
+
+                  {expandedSources.has(i) && (
+                    <div className="mt-1.5 space-y-2">
+                      {msg.sources.map((src, j) => (
+                        <div key={j} className="bg-gray-900 rounded-lg px-3 py-2 border border-gray-700">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-xs font-medium text-blue-400">{src.title}</span>
+                            <span className="text-xs text-gray-500 bg-gray-800 px-2 py-0.5 rounded-full">
+                              {(src.score * 100).toFixed(0)}% match
+                            </span>
+                          </div>
+                          <p className="text-xs text-gray-400 line-clamp-2">{src.excerpt}</p>
+                          <p className="text-xs text-gray-600 mt-1 font-mono">{src.source}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+        <div ref={bottomRef} />
+      </div>
+
+      <div className="border-t border-gray-800 px-4 py-4">
+        <form onSubmit={sendMessage} className="max-w-3xl mx-auto flex gap-3">
+          <input
+            className="flex-1 bg-gray-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 placeholder-gray-500"
+            placeholder="Ask about Next.js..."
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            disabled={loading}
+          />
+          <button
+            type="submit"
+            disabled={loading || !input.trim()}
+            className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed rounded-xl px-5 py-3 text-sm font-medium transition-colors"
           >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
+            {loading ? '...' : 'Send'}
+          </button>
+        </form>
+      </div>
     </div>
-  );
+  )
 }
