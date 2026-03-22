@@ -41,6 +41,10 @@ yarn-error.log*
 next-env.d.ts
 
 
+# generated data
+/data/ingest-cache.json
+/data/vector-store.json
+
 #AI
 CLAUDE.md
 AGENTS.md
