@@ -1,5 +1,5 @@
 import { createEmbeddingClient, createLLMClient } from '../llm/factory'
-import { similaritySearch } from '../vectordb/vector-store'
+import { similaritySearch } from '../vectordb'
 import type { Message } from '../llm/types'
 
 const embedder = createEmbeddingClient()
