@@ -6,6 +6,59 @@ way?" or "what even is TF / IDF / RRF?", the answer is here — with examples.
 
 ---
 
+## How docs get into the system — the full pipeline
+
+Before any search can happen, three steps must run in order:
+
+```
+npm run fetch-docs    ← pull raw .mdx files from the Next.js GitHub repo
+npm run ingest        ← chunk, embed, store in Qdrant
+npm run dev           ← the app can now answer questions
+```
+
+**Why a fetch step at all?**
+
+The documentation lives in the `vercel/next.js` GitHub repository. We do not copy it into
+this repo — that would mean manually updating it every time Next.js releases a new version.
+Instead, `fetch-docs` pulls the latest directly from GitHub so the knowledge base stays
+current.
+
+**How the download works — tarball streaming**
+
+The naive approach would be to use the GitHub REST API to list every file in the `docs/`
+folder and download each one individually. This fails immediately: the API allows 60 requests
+per hour without authentication, and the Next.js docs directory has 200+ files. One fetch
+run would exhaust the quota.
+
+Instead, `fetch-docs` downloads a single tarball of the entire repo:
+
+```
+https://codeload.github.com/vercel/next.js/tar.gz/refs/heads/canary
+```
+
+GitHub exposes this endpoint for any repo and branch. It has no per-file rate limit because
+it is one request, not hundreds.
+
+The tarball is ~100MB for the full Next.js repo. We do not write it to disk. Instead, the
+download stream is piped directly into a tar extractor which filters to only entries inside
+`docs/` — so only the documentation files ever touch disk.
+
+**Why handle HTTP redirects manually?**
+
+Node's built-in `https.get` does not follow redirects automatically. GitHub's codeload
+endpoint redirects once to a CDN before streaming the file. The script follows up to 5
+redirects explicitly so the download works without any third-party HTTP library.
+
+**A subtle tar gotcha — filter receives the original path, not the stripped path**
+
+The `tar` package's `filter` option is called with the entry path as it appears in the
+archive — *before* any `strip` is applied. So even though `strip: 1` turns
+`next.js-canary/docs/foo.mdx` into `docs/foo.mdx` for extraction purposes, the filter
+still sees `next.js-canary/docs/foo.mdx`. The filter must match against the full original
+path, not the stripped one.
+
+---
+
 ## What is RAG?
 
 RAG stands for Retrieval-Augmented Generation.

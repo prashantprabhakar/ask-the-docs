@@ -82,11 +82,12 @@ lib/
     types.ts            # ILLMClient / IEmbeddingClient interfaces
 
 scripts/
+  fetch-docs.ts         # CLI entry point: npm run fetch-docs
   ingest.ts             # CLI entry point: npm run ingest
 
 data/
-  docs/                 # Source documents (Next.js .md/.mdx files)
-  vector-store.json     # Generated — embeddings + chunks (gitignored)
+  docs/                 # Generated — Next.js docs fetched from GitHub (gitignored)
+  ingest-cache.json     # Generated — file hashes for incremental ingest (gitignored)
 ```
 
 ---
@@ -127,21 +128,29 @@ LLM_MODEL=gpt-4o-mini
 EMBEDDING_MODEL=text-embedding-3-small
 ```
 
-### 3. Ingest the docs
+### 3. Fetch the docs
+
+```bash
+npm run fetch-docs
+```
+
+Downloads the Next.js documentation from the official GitHub repository into `data/docs/`. This must run before ingest. Re-run it whenever you want to pull the latest docs.
+
+### 4. Ingest the docs
 
 ```bash
 npm run ingest
 ```
 
-This reads `data/docs/`, chunks and embeds everything, and writes `data/vector-store.json`. Only needs to run once (or when docs change).
+Chunks, embeds, and stores everything in Qdrant. Only needs to run once (or after fetching updated docs).
 
-To start fresh:
+To force a full re-embed from scratch (e.g. after switching embedding models):
 
 ```bash
-npm run ingest:clear
+npm run ingest:full
 ```
 
-### 4. Run the app
+### 5. Run the app
 
 ```bash
 npm run dev
