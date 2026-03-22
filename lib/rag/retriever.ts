@@ -7,6 +7,7 @@ const llm = createLLMClient()
 
 export interface RetrievedSource {
   title: string
+  sectionTitle: string
   source: string
   score: number
   excerpt: string
@@ -76,6 +77,7 @@ export async function ragQuery(question: string): Promise<RAGResponse> {
     answer,
     sources: results.map((r) => ({
       title: r.metadata.title,
+      sectionTitle: r.metadata.sectionTitle,
       source: r.metadata.source,
       score: r.score,
       excerpt: r.content.slice(0, 200) + '...',
@@ -103,6 +105,7 @@ export async function ragQueryStream(question: string): Promise<{
     stream: llm.streamChat(messages),
     sources: results.map((r) => ({
       title: r.metadata.title,
+      sectionTitle: r.metadata.sectionTitle,
       source: r.metadata.source,
       score: r.score,
       excerpt: r.content.slice(0, 200) + '...',

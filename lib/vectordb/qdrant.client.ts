@@ -76,17 +76,16 @@ export interface DocChunk {
   content: string
   embedding: number[]
   metadata: {
-    source: string   // relative file path — used for filtering + citations
-    title: string    // document title
-    chunkIndex: number
+    source: string        // relative file path — used for filtering + citations
+    title: string         // document title (from first # heading)
+    sectionTitle: string  // full heading path, e.g. "App Router > Layouts > Nested Layouts"
+    chunkIndex: number    // position within the section (0 if section fits in one chunk)
     /**
-     * PROD NOTE — In production you'd add more metadata:
-     *   section: string       (heading path, e.g. "Installation > macOS")
+     * PROD NOTE — Also add:
      *   lastModified: string  (ISO date — lets you surface freshness to the user)
      *   docType: string       ("guide" | "api-reference" | "changelog")
      *   url: string           (link to live docs for citation)
-     * Richer metadata enables filtered search: "only search API reference docs"
-     * without re-embedding anything.
+     * These unlock filtered search and freshness-aware ranking later.
      */
   }
 }

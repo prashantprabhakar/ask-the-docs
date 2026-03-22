@@ -121,6 +121,7 @@ export async function ingestDocuments(dir: string) {
       metadata: {
         source: chunk.source,
         title: chunk.title,
+        sectionTitle: chunk.sectionTitle,
         chunkIndex: chunk.chunkIndex,
         /**
          * PROD NOTE — Add here:
