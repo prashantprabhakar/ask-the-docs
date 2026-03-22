@@ -2,7 +2,7 @@
 
 This document explains the concepts behind the RAG pipeline in this project and the reasoning
 behind every major decision. If you are reading the code and wondering "why did they do it this
-way?", the answer is probably here.
+way?" or "what even is TF / IDF / RRF?", the answer is here — with examples.
 
 ---
 
@@ -23,256 +23,432 @@ The LLM never needs to be retrained. You update the vector database when your do
 
 ---
 
+## What is a vector embedding?
+
+An embedding is a list of floating-point numbers that represents the *meaning* of a piece of
+text. The key property: texts with similar meaning end up with vectors that are close together
+in that high-dimensional space, even if they share no words.
+
+Example with Next.js docs:
+
+```
+"How do I navigate between pages?"        → [0.21, -0.54, 0.87, ...]
+"What is the Link component used for?"    → [0.19, -0.51, 0.85, ...]  ← close
+"What is the weather today?"              → [-0.73, 0.12, -0.44, ...] ← far
+```
+
+The first two are asking about the same thing in different words. An embedding model encodes
+that semantic overlap. A keyword search would miss it entirely because "navigate" and "Link"
+share zero words.
+
+We embed every document chunk at ingest time and store those vectors in Qdrant. When a user
+asks a question, we embed the question the same way and search for the closest vectors.
+
+**Why cosine similarity and not Euclidean distance?**
+
+Cosine similarity measures the *angle* between two vectors, not the distance between their
+endpoints. This makes it independent of vector magnitude — a long document and a short one
+about the same topic will have similar angles even if their raw vectors are very different sizes.
+
+---
+
+## What is a sparse vector?
+
+A dense vector (the embedding above) has a value at every position — 768 floats, all non-zero.
+A sparse vector has values at only a handful of positions — most are zero.
+
+Think of it like this: a document has thousands of possible words. A sparse vector has one slot
+per word. Most slots are 0 (word not present). The slots where a word *does* appear get a
+non-zero weight.
+
+Example — a chunk that says "useRouter returns the current router object":
+
+```
+sparse vector: {
+  "userouter" → position 48291: 0.25
+  "returns"   → position 12044: 0.25
+  "current"   → position 7831:  0.25
+  "router"    → position 39102: 0.25
+  "object"    → position 55310: 0.25
+  (everything else is 0)
+}
+```
+
+When you search with the query "useRouter", its sparse vector has a non-zero value at position
+48291. The dot product between query and document is non-zero only where both have values in
+the same positions — i.e. where they share words. This is keyword matching, implemented as
+vector math.
+
+---
+
+## What is TF? What is IDF? What is BM25?
+
+These three terms are the building blocks of classical keyword search — the same ideas that
+power Google's earliest ranking algorithm and modern search engines.
+
+### TF — Term Frequency
+
+TF answers: "how important is this word *within this document*?"
+
+```
+TF(word, document) = count of word in document / total words in document
+```
+
+Example: the chunk "useRouter returns the router. Call useRouter to get the router." has 8
+words. "useRouter" appears 2 times → TF = 2/8 = 0.25. "router" appears 2 times → TF = 0.25.
+"the" appears 1 time → TF = 0.125.
+
+This is exactly what our sparse encoder computes. It is the simplest possible weight.
+
+**The problem with TF alone:** the word "the" scores similarly to "useRouter". Both might
+appear the same number of times. But "the" appears in *every* document, so it tells you
+nothing about which document to pick. "useRouter" is rare — finding it is meaningful.
+
+### IDF — Inverse Document Frequency
+
+IDF answers: "how rare is this word *across all documents*?"
+
+```
+IDF(word) = log(total documents / documents containing word)
+```
+
+If "useRouter" appears in only 3 out of 500 documents:
+  IDF = log(500 / 3) = 5.1  ← high, this word is rare and informative
+
+If "component" appears in 400 out of 500 documents:
+  IDF = log(500 / 400) = 0.22  ← low, this word is everywhere and says little
+
+### BM25 — the combination
+
+BM25 = TF × IDF, with some extra length normalization thrown in.
+
+```
+BM25(word, document) ≈ TF × IDF × length_normalization
+```
+
+It gives high scores to words that appear often *in this document* (TF) but rarely *across
+all documents* (IDF). That combination perfectly captures "this document is specifically about
+useRouter".
+
+**Why we use TF and not BM25:**
+
+BM25 requires IDF, and IDF requires knowing how many documents contain each word — across the
+entire corpus. You cannot compute IDF for a single document in isolation.
+
+This conflicts with incremental ingestion. When one file changes, we re-ingest only that file.
+But computing BM25 correctly would require recomputing IDF for the entire corpus, which means
+re-processing every document. You either give up incremental ingestion or you give up correct
+IDF. We kept incremental ingestion and accepted the simpler TF-only approach.
+
+---
+
+## How the sparse encoder works — step by step
+
+Here is what happens when `encodeSparse("useRouter returns the current router object")` runs:
+
+**Step 1: Tokenize**
+
+Split on whitespace and punctuation, lowercase everything, strip short words and stopwords:
+
+```
+input:  "useRouter returns the current router object"
+tokens: ["userouter", "returns", "current", "router", "object"]
+        ("the" is a stopword → removed)
+```
+
+**Step 2: Count term frequencies**
+
+```
+userouter → 1 occurrence
+returns   → 1 occurrence
+current   → 1 occurrence
+router    → 1 occurrence
+object    → 1 occurrence
+total tokens: 5
+```
+
+**Step 3: Normalize to TF**
+
+Divide each count by total tokens:
+
+```
+userouter → 1/5 = 0.20
+returns   → 1/5 = 0.20
+current   → 1/5 = 0.20
+router    → 1/5 = 0.20
+object    → 1/5 = 0.20
+```
+
+**Step 4: Hash each term to an integer index**
+
+Qdrant sparse vectors use integer indices, not string keys. We cannot store "userouter" as-is.
+We run a DJB2 hash on each term and map it into a space of 500,000 integers:
+
+```
+"userouter" → hash → 48291
+"returns"   → hash → 12044
+"current"   → hash → 7831
+"router"    → hash → 39102
+"object"    → hash → 55310
+```
+
+The same word always hashes to the same integer, so query vectors and document vectors share
+the same index space. When both contain "userouter", both have a non-zero value at index 48291
+— the dot product picks this up.
+
+**Step 5: Output the sparse vector**
+
+```ts
+{ indices: [48291, 12044, 7831, 39102, 55310],
+  values:  [0.20,  0.20,  0.20, 0.20,  0.20] }
+```
+
+This is stored in Qdrant alongside the dense embedding. At query time, the user's question goes
+through the exact same steps and produces its own sparse vector. Qdrant computes the dot product
+between the two sparse vectors — non-zero only where they share words — and that dot product is
+the sparse search score.
+
+---
+
+## Do we write the sparse encoder manually? Are there libraries?
+
+Yes, we wrote it manually. The whole encoder is in `lib/rag/sparse-encoder.ts` and is about
+50 lines of actual logic.
+
+There are libraries, but they have tradeoffs:
+
+| Option | Quality | Works in TypeScript? | Notes |
+|---|---|---|---|
+| **Our TF encoder** (this project) | Basic | Yes | Simplest, no deps, incremental-friendly |
+| **BM25 libs** (`wink-bm25-text-search`, `okapibm25`) | Good | Yes | Need full corpus for IDF — conflicts with incremental ingest |
+| **SPLADE** (via Qdrant FastEmbed) | Best | No (Python only) | Neural model, learns which terms matter — what Qdrant recommends for prod |
+
+SPLADE produces sparse vectors that are far better than any hand-crafted formula. It is a
+neural model trained to assign weights to terms, not just count them. But FastEmbed is
+Python-only, which would mean running a separate Python sidecar service. For a TypeScript
+project that runs fully locally, that is too much complexity for a learning project.
+
+The manual TF encoder is the right call here: simple, zero dependencies, and sufficient to
+demonstrate how hybrid search works.
+
+---
+
+## What is hybrid search? Why do you need both dense and sparse?
+
+Hybrid search runs a dense (semantic) search and a sparse (keyword) search simultaneously and
+combines the results.
+
+Each approach has a fundamental blind spot:
+
+**Dense search alone fails on exact terms.**
+
+Query: "What does `useRouter` return?"
+
+The embedding model might surface chunks about "how routing works in Next.js" because they are
+semantically similar to the query — they are both about routing. But the chunk that literally
+documents the `useRouter` API might rank lower because the embedding captures meaning, not
+exact words.
+
+**Sparse search alone fails on meaning.**
+
+Query: "How do I move between pages in my app?"
+
+The word "navigate" or "move" might not appear in any chunk. The relevant chunk talks about
+`<Link href="/about">` — technically about navigation, but uses completely different vocabulary.
+A keyword search finds nothing. A semantic search finds it easily.
+
+**Together:**
+
+- Dense finds things that *mean* what you asked, even in different words.
+- Sparse finds things that *literally contain* what you typed.
+- The combined result covers both cases.
+
+This matters a lot for technical documentation, which mixes human-language explanations with
+exact API names, function signatures, and config keys.
+
+---
+
+## What is RRF? Why not just average the two scores?
+
+**RRF** stands for Reciprocal Rank Fusion. It is the algorithm that merges the two ranked
+result lists into one.
+
+The naive idea would be: get a dense score and a sparse score for each document, average them,
+sort. The problem is that dense scores and sparse scores live on completely different scales.
+
+Dense scores are cosine similarities: they range from 0 to 1.
+Sparse scores are dot products of TF weights: they range from 0 to some unbounded positive number,
+depending on how many shared terms there are and how frequent they are.
+
+If you average `0.82` (dense) and `4.71` (sparse), the sparse score dominates completely. The
+dense score barely matters. You could normalize both to [0, 1] first, but normalization requires
+knowing the maximum possible score in advance — which you do not.
+
+**RRF works on ranks instead of scores.**
+
+After dense search returns its ranked list and sparse search returns its ranked list, RRF
+assigns each document a combined score based purely on its position in each list:
+
+```
+rrf_score = 1 / (rank_in_dense_list + 60)
+          + 1 / (rank_in_sparse_list + 60)
+```
+
+The constant 60 is a dampening factor. Without it, rank #1 would get score 1.0 and rank #2
+would get 0.5 — a huge cliff. With 60, rank #1 gets 1/61 ≈ 0.016 and rank #2 gets 1/62 ≈
+0.016 — much more gradual, so documents that are consistently good across both lists beat
+documents that are exceptional in one but absent in the other.
+
+**Worked example:**
+
+| Document | Dense rank | Sparse rank | RRF score |
+|---|---|---|---|
+| Chunk A | #1 | #3 | 1/61 + 1/63 = 0.0321 |
+| Chunk B | #2 | #1 | 1/62 + 1/61 = 0.0323 |
+| Chunk C | #1 | not in list | 1/61 + 0 = 0.0164 |
+
+Chunk B wins even though it was not #1 in either list — because it was near the top of both.
+Chunk C was #1 in dense but invisible to sparse, so it loses to documents that showed up in
+both lists.
+
+This is exactly the behavior you want: reward documents that are relevant from multiple angles.
+
+**Why prefetch 20 from each search instead of just 5?**
+
+If dense search only returns 5 results, a relevant document ranked #6 in dense is invisible —
+even if it was #1 in sparse. By fetching 20 candidates from each search, RRF has a large enough
+pool to surface documents that are good in *both* lists. The final `limit: 5` cuts down to what
+the caller actually needs.
+
+---
+
 ## Why Qdrant? Why not FAISS, Chroma, Pinecone, Weaviate?
 
-**FAISS** is a library, not a database. It keeps everything in memory and on a flat file. It
-has no concept of filtering by metadata, no hybrid search, and no persistence story beyond
-manually serializing numpy arrays. Fine for research notebooks, not for a real pipeline.
+**FAISS** is a library, not a database. It keeps everything in memory and on a flat file. No
+metadata filtering, no hybrid search, no persistence beyond manually serializing arrays. Fine
+for research, not for a real pipeline.
 
-**Chroma** is easy to set up but is designed as an embedded store for prototypes. It does not
-support named vectors or native hybrid search. Switching to hybrid search later means rewriting
-the store layer.
+**Chroma** is easy to set up but designed for prototypes. It does not support named vectors or
+native hybrid search. Switching to hybrid search later means rewriting the store layer.
 
-**Pinecone** is managed cloud-only. It requires an account, an API key, and costs money at any
-meaningful scale. Not suitable for a project that should run locally with no external
-dependencies.
+**Pinecone** is managed cloud-only — requires an account, API key, and costs money at scale.
+Not suitable for a project that should run locally with no external dependencies.
 
-**Weaviate** is a strong production option, but heavier to operate than Qdrant and its
-TypeScript client is less mature.
+**Weaviate** is a strong production option but heavier to operate and its TypeScript client is
+less mature.
 
 **Qdrant** wins here because:
 - Runs locally with one Docker command: `docker run -p 6333:6333 qdrant/qdrant`
-- Supports named vectors natively — one point can hold a dense and a sparse vector
-- Hybrid search (dense + sparse + RRF fusion) is a first-class feature, not a workaround
+- Named vectors natively — one stored point holds a dense and a sparse vector side by side
+- Hybrid search + RRF is a first-class feature, not a workaround
 - HNSW index means search is O(log n), not O(n)
-- The REST client is simple and the API is well-documented
-
----
-
-## What is a vector embedding?
-
-An embedding is a list of floating-point numbers (a vector) that represents the meaning of a
-piece of text. Texts with similar meaning have vectors that are close together in vector space.
-
-Example: "How do I navigate between pages?" and "What is the Link component used for?" have
-very different words but similar meaning — their embeddings will be close. "What is the weather
-today?" will be far away.
-
-The embedding model (e.g. `nomic-embed-text` via Ollama, or `text-embedding-3-small` via
-OpenAI) is what converts text to these vectors. We embed both the documents (at ingest time)
-and the user's question (at query time), then find the documents closest to the question.
-
-**Why cosine similarity?** We measure closeness with cosine similarity — the angle between two
-vectors, not their distance. This makes the score independent of vector magnitude, which matters
-because document chunks vary in length.
-
----
-
-## What is a sparse vector? What is TF?
-
-A dense vector has a value at every position (e.g. 768 floats, all non-zero). A sparse vector
-has values at only a small number of positions — most are zero.
-
-In our sparse encoding, each unique word in a document maps to a position (an integer index),
-and the value at that position is the term's weight. Documents with many shared keywords have
-overlapping non-zero positions and score higher.
-
-**TF** stands for Term Frequency. It is the simplest possible weight: how often does this word
-appear in this chunk, divided by the total number of words. A word that appears 10 times in a
-20-word chunk gets TF = 0.5.
-
-**Why TF and not BM25?**
-
-BM25 is better. It adds two improvements over TF:
-
-1. **IDF (Inverse Document Frequency)** — common words across all documents (like "the" or
-   "returns") get down-weighted. Rare words that appear in only a few documents get
-   up-weighted. This is powerful: the word "useRouter" in a Next.js doc is much more
-   informative than the word "component".
-
-2. **Length normalization** — a word appearing 3 times in a 10-word chunk is more significant
-   than the same word appearing 3 times in a 1000-word chunk. BM25 adjusts for this.
-
-BM25 is skipped here because it requires IDF, and IDF requires knowing the frequency of every
-term across the entire corpus. That conflicts with incremental ingestion — you would need to
-recompute IDF every time a document changes, which requires either a two-pass ingest or a
-running IDF table stored somewhere.
-
-TF-only is "good enough for a learning project" and still improves retrieval over dense-only
-search for exact keyword matches.
-
-**Why not SPLADE?**
-
-SPLADE is the state of the art for sparse vectors. It is a neural model that learns which terms
-are important, producing sparse vectors that are far better than any hand-crafted TF or BM25
-formula. Qdrant recommends SPLADE via their FastEmbed library for production.
-
-SPLADE is skipped here because it requires a Python model (FastEmbed is Python-only), which
-adds a service dependency. For a TypeScript project that runs fully locally, a hand-coded TF
-encoder is the right tradeoff.
-
-**How does the term-to-index mapping work?**
-
-We cannot store the actual word strings in Qdrant's sparse vector — it only accepts integer
-indices. So we hash each word using DJB2 into a space of 500,000 integers. The same word
-always maps to the same integer, so query and document vectors share the same "vocabulary
-space".
-
-Hash collisions (two different words mapping to the same integer) are rare at this vocab size
-and do not cause incorrect results — just slightly inflated scores for those two terms.
-
----
-
-## What is hybrid search?
-
-Hybrid search combines two retrieval strategies in a single query:
-
-- **Dense retrieval** — find chunks semantically similar to the question (via embeddings)
-- **Sparse retrieval** — find chunks that share exact keywords with the question (via TF/BM25)
-
-Each strategy has blind spots:
-
-- Dense alone: "What does `useRouter` return?" might surface chunks about routing in general,
-  missing the chunk that literally explains `useRouter`, because semantically similar content
-  may rank above it.
-- Sparse alone: "How do I navigate between pages?" might miss the `Link` component docs because
-  the word "navigate" doesn't appear — only "link" and "href" do.
-
-Together they cover each other's gaps.
-
----
-
-## What is RRF? Why not weighted score averaging?
-
-**RRF** stands for Reciprocal Rank Fusion. It is the algorithm Qdrant uses to merge the two
-ranked result lists from dense and sparse search.
-
-Instead of combining scores directly, RRF works on ranks:
-
-```
-rrf_score(document) = 1 / (rank_in_dense_list + 60)
-                    + 1 / (rank_in_sparse_list + 60)
-```
-
-The constant 60 dampens the impact of very high ranks — it ensures a document ranked #1 in
-one list does not completely dominate a document ranked #2 in both lists.
-
-**Why not just average the scores?**
-
-Dense scores (cosine similarity, 0 to 1) and sparse scores (dot product of TF weights, 0 to N)
-live on completely different scales. Averaging them directly is meaningless — the sparse score
-would dominate simply because it can be larger. You would need to normalize both first, which
-requires knowing the score distribution — a chicken-and-egg problem.
-
-RRF avoids all of this. Ranks are always comparable: rank #3 in one list means the same thing
-as rank #3 in another list, regardless of the raw scores.
-
-**Why prefetch 20 from each instead of just fetching 5?**
-
-If we only asked each search for 5 results, a relevant document might be ranked #6 in dense
-and #4 in sparse — it would never appear in the fusion. By prefetching 20 from each, the
-fusion has a large enough candidate pool to find documents that are good in both lists, even if
-neither list has them in the very top results.
+- Clean REST API with a well-typed TypeScript client
 
 ---
 
 ## Why structural chunking? What was wrong with character chunking?
 
 The v1 approach split documents every 1500 characters. The problem is that chunk boundaries
-have no meaning — a chunk might start mid-sentence and end mid-paragraph. Worse, adding a
-paragraph anywhere in a document shifts every chunk boundary after it. If chunk IDs are
-positional (`source-0`, `source-1`...), they silently point to wrong content.
+carry no meaning — a chunk might start mid-sentence and end mid-paragraph.
 
-Structural chunking splits on Markdown headings first (`##`, `###`). Each section becomes an
-independent unit. If a section is too large, it is then sub-split by character count.
+Worse: adding a paragraph anywhere in a document shifts every chunk boundary after that point.
+If chunk IDs are positional (`source-0`, `source-1`...), adding 200 characters to page 1 makes
+every chunk on page 2 onwards a slightly different mix of content — but the IDs are the same.
+The store is silently corrupted: wrong embeddings stored under correct-looking IDs.
+
+Structural chunking splits on Markdown headings first (`##`, `###`). Each section is an
+independent unit. If a section is too large for one chunk, it is then sub-split by character
+count.
 
 Benefits:
-- Each chunk corresponds to a meaningful section of the docs
-- Editing one section does not affect any other section's chunks
-- The heading path (`App Router > Layouts > Nested Layouts`) is stored in metadata and shown
-  in citations, so the user knows exactly where the answer came from
+- Editing section 3 does not affect sections 4, 5, 6 at all — their content and IDs are stable
+- Each chunk corresponds to a meaningful piece of documentation
+- The full heading path (`App Router > Layouts > Nested Layouts`) is stored in metadata and
+  surfaced in citations — the user knows exactly where the answer came from
 
 ---
 
 ## Why UUID v5 for chunk IDs? Why not random UUIDs?
 
-UUID v5 is a deterministic UUID: given the same inputs, it always produces the same UUID.
-We generate it from `namespace + source_path + content`.
+UUID v5 is deterministic: given the same inputs, it always produces the same UUID. We derive it
+from `namespace + source_path + content`.
 
-This means re-running ingest on an unchanged file produces the same UUIDs. Qdrant's `upsert`
-is idempotent — it overwrites a point if the ID already exists, or creates it if not. So
-re-ingesting unchanged content is a no-op at the database level.
+Re-running ingest on an unchanged file produces the same UUIDs → Qdrant's upsert is a no-op.
+Change the content → new UUID → the old chunk is an orphan, cleaned up by `deleteChunksBySource`
+before the next upsert.
 
-Random UUIDs would create a new point on every ingest, duplicating every chunk in the store.
+Random UUIDs would create a new point on every ingest, duplicating every chunk in the store
+indefinitely.
 
-**Why include source in the ID?**
-
-If two different files have an identical section (e.g. both say "See the official docs"), they
-should have different IDs because their metadata (source, title) differs. Including the source
-path in the ID ensures this.
+Source is included in the ID so that two different files with identical content (e.g. both say
+"See the official docs") get different IDs, preserving their separate metadata.
 
 ---
 
 ## Why a file-hash cache for incremental ingestion?
 
-Embedding is the most expensive step — it requires an API call (or local model inference) per
-batch of chunks. Re-embedding unchanged files on every ingest run wastes time and money.
+Embedding is the most expensive step — an API call per batch. Re-embedding 500 unchanged files
+to pick up 1 changed one is wasteful.
 
-The cache (`data/ingest-cache.json`) stores a hash of each file's content. On each ingest run,
-if the hash has not changed, the file is skipped entirely. If it has changed:
+The cache (`data/ingest-cache.json`) stores a SHA-256 hash of each file's content. On each
+ingest run, if the hash has not changed, the file is skipped entirely — no chunking, no API
+calls, no writes to Qdrant.
 
+If the hash changed:
 1. Delete all existing chunks for that source from Qdrant
-2. Re-chunk, re-embed, and upsert the new chunks
+2. Re-chunk, re-embed, upsert fresh chunks
 
-Deleting before upserting is critical. If a section is removed, its old chunk has a new content
-hash → new UUID → the old UUID becomes an orphan in Qdrant, never cleaned up, cited forever.
+Deleting before upserting is critical. If a section is removed from the file, its chunk gets a
+new content hash → new UUID → the old UUID becomes an orphan that would be cited forever.
 Deleting by source first guarantees a clean slate.
 
 ---
 
 ## Why not use LangChain?
 
-LangChain is a framework that provides abstractions for chains, agents, memory, document
-loaders, vector store connectors, and more.
+LangChain provides abstractions for chains, agents, document loaders, vector store connectors,
+and more.
 
-We avoided it here deliberately:
+We avoided it deliberately:
 
-1. **Abstraction hides learning** — the whole point of this project is to understand what a
-   RAG pipeline actually does. LangChain wraps every step behind interfaces. You end up
-   knowing how to call LangChain, not how RAG works.
+1. **Abstraction hides learning.** This project exists to understand how a RAG pipeline works.
+   LangChain wraps every step behind interfaces. You end up knowing how to configure LangChain,
+   not how retrieval actually works.
 
-2. **Magic breaks in unexpected ways** — LangChain's abstractions leak. When something goes
-   wrong (wrong chunk sizes, bad retrieval scores, silent errors), you need to understand the
-   internals anyway. Better to own them from the start.
+2. **Magic breaks in unexpected ways.** When something goes wrong (bad retrieval quality,
+   wrong chunk sizes, silent errors), you need to understand the internals anyway. Better to own
+   them from the start.
 
-3. **Overkill for this scope** — LangChain's value is in connecting many components quickly.
-   Our pipeline has four steps: chunk, embed, store, retrieve. Writing those directly is less
-   code than configuring LangChain to do the same thing.
+3. **Overkill for this scope.** Our pipeline is four steps: chunk, embed, store, retrieve.
+   Writing those directly is less code than configuring LangChain to do the same.
 
-In production at scale, LangChain (or LlamaIndex) can be a reasonable choice. Here, writing
-it from scratch is the point.
+In production at scale, LangChain or LlamaIndex can be a reasonable choice — they shine when
+connecting many components quickly. For a learning project, writing from scratch is the point.
 
 ---
 
 ## Why not use the OpenAI Assistants API or a managed RAG product?
 
-Products like OpenAI Assistants (with file search) or Amazon Bedrock Knowledge Bases handle
+Products like OpenAI Assistants (file search) or Amazon Bedrock Knowledge Bases handle
 chunking, embedding, storage, and retrieval for you. They are fine for shipping quickly.
 
-We avoid them here for the same reason as LangChain: they hide the implementation. Understanding
-hybrid search, RRF, and chunk quality requires seeing them directly.
+We avoid them for the same reason as LangChain: they hide the implementation. You cannot
+observe chunk quality, retrieval scores, or how hybrid search behaves. Understanding those
+things is the goal here.
 
 ---
 
 ## Score threshold — why filter low-scoring results?
 
-Qdrant always returns `topK` results. If no chunk is relevant to the question, it still returns
-the least-bad chunks. An LLM given irrelevant context will hallucinate — it will try to answer
-using the context even when the context has nothing to do with the question.
+Qdrant always returns `topK` results, even when none of them are relevant. If the user asks
+something that has no answer in the documentation, the search still returns the "least-bad"
+chunks. An LLM given irrelevant context will hallucinate — it will construct a plausible-sounding
+answer from the noise.
 
-Filtering results below a minimum score (e.g. 0.30) gives the retriever a way to say "nothing
-is relevant" and return an honest "I couldn't find that in the documentation" instead of a
-plausible-sounding wrong answer.
+Filtering results below a minimum score (e.g. 0.30) gives the system a way to say "nothing is
+relevant" and return an honest "I couldn't find that in the documentation" instead.
 
-The threshold value is empirical — you tune it by looking at score distributions across a set
-of representative queries.
+The threshold value is empirical. You set it by running a set of known-irrelevant queries,
+looking at what scores they produce, and picking a cutoff that rejects them reliably without
+cutting off legitimate low-confidence results. There is no universal right answer — it depends
+on your embedding model and your documents.
