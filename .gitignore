@@ -44,6 +44,7 @@ next-env.d.ts
 # generated data
 /data/docs/
 /data/ingest-cache.json
+/data/idf-table.json
 /data/vector-store.json
 
 #AI

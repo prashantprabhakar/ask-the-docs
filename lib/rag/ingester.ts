@@ -2,8 +2,9 @@ import fs from 'fs'
 import path from 'path'
 import { createEmbeddingClient } from '../llm/factory'
 import { chunkDocument } from './chunker'
-import { upsertChunks, chunkId, deleteChunksBySource } from '../vectordb'
-import { encodeSparse } from './sparse-encoder'
+import { upsertChunks, chunkId, deleteChunksBySource, scrollAllChunkTexts } from '../vectordb'
+import { encodeSparse, tokenize, reloadIdfTable } from './sparse-encoder'
+import { buildIdfTable, saveIdfTable } from './idf-table'
 import { loadCache, saveCache, hashFileContent } from './ingest-cache'
 import type { RawDocument } from './chunker'
 import type { DocChunk } from '../vectordb'
@@ -206,6 +207,28 @@ export async function ingestDocuments(dir: string, options: IngestOptions = {}) 
 
   // ── Step 3: Save updated cache ─────────────────────────────────────────────
   saveCache(newCache)
+
+  // ── Step 4: Rebuild IDF table from full corpus ─────────────────────────────
+  // Scroll all chunk texts from Qdrant (including chunks from unchanged files)
+  // so the IDF table reflects the complete corpus, not just what changed.
+  //
+  // This runs even when nothing changed (processed === 0) because the table
+  // may not exist yet (e.g. first run after pulling the repo).
+  //
+  // PROD NOTE — For large corpora, maintain term counts incrementally
+  //   (update only the chunks that changed) rather than scrolling everything.
+  //   See idf-table.ts for details.
+  console.log('\nRebuilding IDF table...')
+  const allTexts = await scrollAllChunkTexts()
+  if (allTexts.length > 0) {
+    const termSets = allTexts.map((text) => new Set(tokenize(text)))
+    const idfTable = buildIdfTable(termSets)
+    saveIdfTable(idfTable)
+    reloadIdfTable()
+    console.log(`IDF table saved: ${Object.keys(idfTable.termDf).length} unique terms across ${idfTable.totalDocs} chunks`)
+  } else {
+    console.log('No chunks in store — IDF table not built.')
+  }
 
   console.log('\n=== Ingestion complete ===')
   console.log(`Files processed : ${processed}`)

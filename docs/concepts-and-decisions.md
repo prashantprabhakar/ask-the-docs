@@ -443,7 +443,7 @@ Source is included in the ID so that two different files with identical content 
 Embedding is the most expensive step — an API call per batch. Re-embedding 500 unchanged files
 to pick up 1 changed one is wasteful.
 
-The cache (`data/ingest-cache.json`) stores a SHA-256 hash of each file's content. On each
+The cache (`data/ingest-cache.json`) stores an MD5 hash of each file's content. On each
 ingest run, if the hash has not changed, the file is skipped entirely — no chunking, no API
 calls, no writes to Qdrant.
 
@@ -454,6 +454,59 @@ If the hash changed:
 Deleting before upserting is critical. If a section is removed from the file, its chunk gets a
 new content hash → new UUID → the old UUID becomes an orphan that would be cited forever.
 Deleting by source first guarantees a clean slate.
+
+---
+
+## File-level cache vs section-level cache — what is the tradeoff?
+
+The current cache operates at **file granularity**: one hash per file. If any byte in the file
+changes, all chunks for that file are deleted and re-embedded.
+
+This is fine when files are small. But for large files — long API reference pages, generated
+docs — a one-paragraph edit triggers re-embedding of hundreds of sections.
+
+**Section-level caching** pushes the granularity down to the section (heading boundary):
+
+```
+File-level cache:
+  { "routing/intro.md": "a3f9c1..." }
+  → one byte changes → re-embed all 50 sections
+
+Section-level cache:
+  {
+    "routing/intro.md": {
+      "App Router > Introduction":    { hash: "a3f...", chunkIds: ["uuid1"] },
+      "App Router > Getting Started": { hash: "b72...", chunkIds: ["uuid2", "uuid3"] },
+      ...
+    }
+  }
+  → one section changes → re-embed that section only, skip the other 49
+```
+
+The ingest flow becomes:
+1. Re-split the file into sections
+2. Hash each section independently
+3. Skip sections whose hash matches the cache
+4. For changed/new sections: embed and upsert only those chunks
+5. For removed sections (in cache but not in new split): delete only those chunk IDs
+
+**Why this is correct and not just an optimisation:**
+
+Because chunk IDs are content-addressed (UUID v5 of source + content), an unchanged section
+produces identical chunk IDs on every run. The Qdrant upsert would be a no-op for those IDs
+anyway. Section-level caching just avoids the embedding API call that would tell us that.
+
+The only reason the current code uses `deleteChunksBySource` (delete everything for the file)
+is to handle orphan chunks from removed or merged sections. Section-level tracking knows exactly
+which chunk IDs belong to each section, so it can delete precisely and skip the nuclear option.
+
+**When does section-level caching matter?**
+
+- Large files (100+ sections) where most edits touch a small fraction of sections
+- Frequent doc updates (running ingest on every commit/deploy)
+- Paid embedding APIs where each call costs money
+
+For small doc sets with infrequent updates, file-level is sufficient and simpler.
 
 ---
 

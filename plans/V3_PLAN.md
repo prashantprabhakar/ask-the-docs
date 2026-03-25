@@ -36,7 +36,10 @@ IDF(term) = log((N - df + 0.5) / (df + 0.5) + 1)
 IDF table is rebuilt after every ingest. During query time the table is loaded once and cached
 in memory for the process lifetime.
 
-Libraries: `wink-bm25-text-search` handles the full BM25 formula cleanly in TypeScript.
+Libraries: `wink-bm25-text-search` was considered but manages a full document corpus internally
+(feed it documents, query against it). Its API is designed for standalone search, not for
+producing `{ indices, values }` sparse vectors for Qdrant. The BM25 IDF formula is a single
+line — implemented manually in `idf-table.ts` with no extra dependency.
 
 ---
 
@@ -274,6 +277,56 @@ Embedding batches within each file can also run concurrently with a separate sem
 
 ---
 
+## Problem 12: Ingest cache is file-level — one changed byte re-embeds the whole file
+
+**Current:** `ingest-cache.json` stores `{ source → MD5(fileContent) }`. If any byte in a file
+changes, all chunks for that file are deleted and re-embedded from scratch.
+
+For small docs pages this is fine. For large files (long reference pages, generated API docs),
+a single paragraph edit re-embeds hundreds of sections — hundreds of unnecessary embedding API calls.
+
+**Why it matters:** At scale (large files, frequent doc updates, paid embedding APIs) this wastes
+money and time. A 500-section file edited in one place should re-embed 1 section, not 500.
+
+**V3 fix: Section-level cache**
+
+Promote the cache from file-level to section-level:
+
+```
+Before:
+  cache: { "routing/intro.md": "a3f9c1..." }
+
+After:
+  cache: {
+    "routing/intro.md": {
+      "App Router > Introduction":    { hash: "a3f...", chunkIds: ["uuid1"] },
+      "App Router > Getting Started": { hash: "b72...", chunkIds: ["uuid2", "uuid3"] }
+    }
+  }
+```
+
+On each ingest run for a changed file:
+1. Re-split the file into sections (same `splitIntoSections` logic)
+2. Hash each section's content independently
+3. Compare against the cached section hashes
+4. **Skip** sections whose hash is unchanged — no embedding call, no Qdrant write
+5. For changed/new sections: embed and upsert only those chunks
+6. For removed sections (in cache but not in new split): delete only those chunk IDs
+
+This makes ingest O(changed sections) instead of O(all sections in changed file).
+
+**Why delete only the stale chunk IDs instead of deleteChunksBySource?**
+
+With section-level tracking, the cache knows exactly which chunk IDs belonged to each section.
+On a section change, delete only those IDs → upsert new ones. The rest of the file is untouched.
+`deleteChunksBySource` is the nuclear option — reserved for full re-ingests only.
+
+**Tradeoff:** The cache file grows larger (section entries instead of one hash per file) and
+the ingest logic is more complex. Worth it once file sizes or update frequency make file-level
+re-embedding expensive.
+
+---
+
 ## V3 File Changes
 
 ```
@@ -282,7 +335,8 @@ lib/
     sparse-encoder.ts     ← REWRITE: BM25 with IDF table
     idf-table.ts          ← NEW: build + load IDF table from corpus
     chunker.ts            ← UPDATE: front-matter strip, code block + table preservation
-    ingester.ts           ← UPDATE: contextual prefix per chunk, parallel processing, metadata
+    ingester.ts           ← UPDATE: contextual prefix per chunk, parallel processing, metadata, section-level cache
+    ingest-cache.ts       ← UPDATE: section-level hashing (source → section → { hash, chunkIds })
     retriever.ts          ← UPDATE: query expansion, re-ranking, summarized history
     reranker.ts           ← NEW: cross-encoder re-ranking (Xenova or Cohere)
     query-expander.ts     ← NEW: LLM-based query expansion
@@ -330,5 +384,9 @@ Frontend + retriever change. Independently testable with long conversations.
 ### Step 7 — Observability + reliability
 Logger, health endpoint, rate limiting, p-retry. Unglamorous but essential.
 
-### Step 8 — Eval pipeline
+### Step 8 — Section-level ingest cache
+Upgrade `ingest-cache.ts` to track section hashes and chunk IDs. Update `ingester.ts` to diff
+at section granularity. Run with a large file to verify only changed sections are re-embedded.
+
+### Step 9 — Eval pipeline
 Build golden dataset. Run eval before and after each step above to measure actual impact.

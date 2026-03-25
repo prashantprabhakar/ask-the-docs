@@ -367,6 +367,47 @@ export async function getChunkCount(): Promise<number> {
 }
 
 /**
+ * Scroll through all chunks in the collection and return their text content.
+ *
+ * Used by the ingester to build the IDF table after each ingest run.
+ * Fetches in pages of 100 to avoid loading the entire corpus into memory
+ * at once — Qdrant's scroll API returns a `next_page_offset` cursor that
+ * is null when the last page has been reached.
+ *
+ * PROD NOTE — For very large collections (millions of points), this scroll
+ *   is still O(N). At that scale, maintain term counts incrementally in a
+ *   separate store (Redis / Postgres) and update them during ingest instead
+ *   of scanning the full corpus each time.
+ */
+export async function scrollAllChunkTexts(): Promise<string[]> {
+  await ensureCollection()
+
+  const texts: string[] = []
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let offset: any = undefined
+
+  do {
+    const result = await withRetry(() =>
+      client.scroll(COLLECTION, {
+        limit: 100,
+        ...(offset !== undefined && { offset }),
+        with_payload: ['content'],
+        with_vector: false,
+      })
+    )
+
+    for (const point of result.points) {
+      const content = point.payload?.content
+      if (typeof content === 'string') texts.push(content)
+    }
+
+    offset = result.next_page_offset ?? null
+  } while (offset !== null)
+
+  return texts
+}
+
+/**
  * Drop the collection entirely. Used by `npm run ingest:full`.
  *
  * PROD NOTE — Never expose this as an API endpoint. Treat collection drops

@@ -3,7 +3,8 @@
  *
  * Produces a sparse vector { indices, values } from text, where:
  *   - indices = integer IDs representing unique terms
- *   - values  = normalized term frequency (TF) weights
+ *   - values  = BM25-weighted scores (TF × IDF) when an IDF table is
+ *               available, or plain TF weights as a fallback
  *
  * This is stored alongside the dense embedding in Qdrant and used in hybrid
  * search to boost results that contain the exact terms from the query.
@@ -16,25 +17,33 @@
  *   chunks that literally mention "useRouter" score higher.
  *   Qdrant fuses both with Reciprocal Rank Fusion (RRF).
  *
- * PROD NOTE — This is simplified TF-based sparse encoding, not true BM25.
- *   True BM25 requires IDF (Inverse Document Frequency) scores computed from
- *   the full corpus, which conflicts with incremental ingestion unless you
- *   maintain a running IDF table.
+ * BM25 VS TF:
+ *   TF alone gives "component" and "useRouter" the same weight if they
+ *   appear the same number of times in a chunk. BM25 adds IDF — "component"
+ *   appears in hundreds of chunks so its IDF is near zero. "useRouter"
+ *   appears in only a handful, so it gets a high IDF multiplier. The sparse
+ *   search now correctly prioritises chunks that are specifically about
+ *   what the user typed.
  *
- *   Production options, roughly in order of quality:
+ *   IDF is applied at query time (asymmetric BM25). Document sparse vectors
+ *   in Qdrant use plain TF. See idf-table.ts for the reasoning.
+ *
+ * PROD NOTE — Production options, roughly in order of quality:
  *
  *   1. SPLADE (best) — a neural model that produces learned sparse vectors.
  *      Much better recall than BM25. Available via Qdrant's FastEmbed (Python)
  *      or as a HuggingFace model. This is what Qdrant recommends for production.
  *      https://qdrant.tech/articles/sparse-vectors/
  *
- *   2. BM25 with corpus IDF — classic, interpretable, no ML needed.
- *      Requires a two-pass ingest (collect term counts → compute IDF → encode).
- *      Libraries: `wink-bm25-text-search`, `okapibm25`.
+ *   2. BM25 with corpus IDF (this implementation) — classic, interpretable.
+ *      Requires a two-pass ingest: collect term counts → compute IDF → encode.
  *
- *   3. TF-only (this implementation) — simplest, no corpus stats needed,
- *      good enough to demonstrate hybrid search and improve keyword matching.
+ *   3. TF-only — simplest, no corpus stats, good enough to demonstrate hybrid
+ *      search. Used as a fallback when the IDF table has not been built yet.
  */
+
+import { loadIdfTable, computeIdf, buildIdfTable } from './idf-table'
+import type { IdfTable } from './idf-table'
 
 // ─── Stopwords ────────────────────────────────────────────────────────────────
 
@@ -62,15 +71,16 @@ const STOPWORDS = new Set([
 /**
  * Tokenize text into clean lowercase terms.
  *
- * Splits on whitespace and punctuation, strips Markdown syntax characters,
- * removes short tokens and stopwords.
+ * Exported so the ingester can reuse the same tokenization when building
+ * the IDF table — consistency is critical. If the IDF table is built with
+ * different tokenization than the encoder uses, term lookups will miss.
  *
  * PROD NOTE — Production tokenizers also handle:
  *   - Stemming / lemmatization ("running" → "run") to match more variants
  *   - Subword tokenization for code identifiers ("useRouter" → ["use", "router"])
  *   - Language detection for multilingual corpora
  */
-function tokenize(text: string): string[] {
+export function tokenize(text: string): string[] {
   return text
     .toLowerCase()
     .replace(/```[\s\S]*?```/g, ' ') // strip code blocks — often too noisy
@@ -108,6 +118,39 @@ function termIndex(term: string): number {
   return Math.abs(hash) % VOCAB_SIZE
 }
 
+// ─── IDF Table (lazy singleton) ───────────────────────────────────────────────
+
+/**
+ * Lazy-loaded IDF table.
+ *
+ * `undefined` = not yet attempted to load.
+ * `null`      = attempted but table does not exist yet (first ingest run).
+ * `IdfTable`  = loaded and ready.
+ *
+ * The ingester calls reloadIdfTable() after building a fresh table so the
+ * next query in the same process sees the updated weights immediately.
+ */
+let _idfTable: IdfTable | null | undefined = undefined
+
+function getIdfTable(): IdfTable | null {
+  if (_idfTable === undefined) {
+    _idfTable = loadIdfTable()
+    if (_idfTable) {
+      console.log(`[sparse-encoder] IDF table loaded (${_idfTable.totalDocs} docs, ${Object.keys(_idfTable.termDf).length} terms)`)
+    }
+  }
+  return _idfTable
+}
+
+/**
+ * Force a reload of the IDF table from disk.
+ * Called by the ingester after it rebuilds the table so the new weights
+ * take effect immediately without restarting the process.
+ */
+export function reloadIdfTable(): void {
+  _idfTable = loadIdfTable()
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export interface SparseVector {
@@ -116,32 +159,57 @@ export interface SparseVector {
 }
 
 /**
- * Encode text as a TF-weighted sparse vector.
+ * Encode text as a BM25-weighted sparse vector (or TF-only if no IDF table).
  *
  * Each unique term in the text becomes one entry in the sparse vector:
- *   index = termIndex(term)   — stable integer ID for this term
- *   value = count / total     — normalized term frequency (0 to 1)
+ *   index = termIndex(term)        — stable integer ID for this term
+ *   value = TF(term) × IDF(term)  — BM25 weight (or TF if no IDF table)
  *
- * Higher TF → term appears more in this chunk → higher weight in sparse search.
+ * Terms with a BM25 weight of zero (present in every chunk → IDF = 0)
+ * are excluded from the vector — they carry no discriminating signal.
+ *
+ * WHEN IDF IS NOT AVAILABLE (first ingest run):
+ *   Falls back to plain TF: value = count / total_tokens.
+ *   The IDF table is built at the end of the ingest run, so subsequent
+ *   runs and all query-time calls will use full BM25 weights.
  */
 export function encodeSparse(text: string): SparseVector {
   const tokens = tokenize(text)
   if (tokens.length === 0) return { indices: [], values: [] }
 
   // Count raw term frequencies
-  const tf = new Map<string, number>()
+  const tfCounts = new Map<string, number>()
   for (const token of tokens) {
-    tf.set(token, (tf.get(token) ?? 0) + 1)
+    tfCounts.set(token, (tfCounts.get(token) ?? 0) + 1)
   }
 
   const total = tokens.length
+  const idf = getIdfTable()
+
   const indices: number[] = []
   const values: number[] = []
 
-  for (const [term, count] of tf) {
+  for (const [term, count] of tfCounts) {
+    const tf = count / total
+
+    let weight: number
+    if (idf) {
+      // BM25: TF × IDF. Terms with IDF=0 (in every chunk) are skipped.
+      const idfScore = computeIdf(term, idf)
+      if (idfScore === 0) continue
+      weight = tf * idfScore
+    } else {
+      // Fallback: plain TF (first run, no IDF table yet)
+      weight = tf
+    }
+
     indices.push(termIndex(term))
-    values.push(count / total) // normalized TF
+    values.push(weight)
   }
 
   return { indices, values }
 }
+
+// ─── IDF Table Builder (used by ingester) ─────────────────────────────────────
+
+export { buildIdfTable, saveIdfTable } from './idf-table'
