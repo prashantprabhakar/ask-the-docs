@@ -2,6 +2,7 @@ import { createEmbeddingClient, createLLMClient } from '../llm/factory'
 import { similaritySearch } from '../vectordb'
 import { encodeSparse } from './sparse-encoder'
 import { rerank } from './reranker'
+import { expandQuery } from './query-expander'
 import type { Message } from '../llm/types'
 
 const embedder = createEmbeddingClient()
@@ -93,18 +94,47 @@ Question: ${question}`,
 }
 
 /**
+ * Expand the question into multiple query variants, search for each in
+ * parallel, and return a deduplicated candidate pool.
+ *
+ * Deduplication key: chunk content. If the same chunk is returned by multiple
+ * query variants, only the first occurrence is kept (scores are discarded
+ * before re-ranking anyway — the cross-encoder re-scores everything).
+ *
+ * Expansion + parallel search run concurrently with Promise.all:
+ *   - expandQuery fires the LLM for variants
+ *   - embedBatch encodes all variants in one call
+ *   - N similaritySearch calls run in parallel (one per variant)
+ */
+async function retrieveCandidates(question: string) {
+  // Expand the query and embed all variants in a single batch call
+  const queries = await expandQuery(question)
+  const embeddings = await embedder.embedBatch(queries)
+
+  // Parallel search — one per query variant
+  const allResults = await Promise.all(
+    queries.map((q, i) => similaritySearch(embeddings[i], encodeSparse(q), RETRIEVAL_CANDIDATES))
+  )
+
+  // Deduplicate by content — first-seen wins
+  const seen = new Set<string>()
+  const merged = allResults.flat().filter((r) => {
+    if (seen.has(r.content)) return false
+    seen.add(r.content)
+    return true
+  })
+
+  return merged.filter((r) => r.score >= MIN_SCORE)
+}
+
+/**
  * The full RAG query pipeline — called on every user question.
  *
- * Retrieve → Augment → Generate
+ * Retrieve → Re-rank → Augment → Generate
  */
 export async function ragQuery(question: string, history: Message[] = []): Promise<RAGResponse> {
-  // Step 1: RETRIEVE — embed the question and search for similar chunks
-  const queryEmbedding = await embedder.embed(question)
-  const querySparse = encodeSparse(question)
-  const results = await similaritySearch(queryEmbedding, querySparse, RETRIEVAL_CANDIDATES)
-
-  // Drop chunks below the score threshold — don't send noise to the re-ranker
-  const candidates = results.filter((r) => r.score >= MIN_SCORE)
+  // Step 1: RETRIEVE — expand query, search variants in parallel, deduplicate
+  const candidates = await retrieveCandidates(question)
 
   if (candidates.length === 0) {
     return {
@@ -146,11 +176,7 @@ export async function ragQueryStream(question: string, history: Message[] = []):
   stream: AsyncIterable<string>
   sources: RetrievedSource[]
 }> {
-  const queryEmbedding = await embedder.embed(question)
-  const querySparse = encodeSparse(question)
-  const results = await similaritySearch(queryEmbedding, querySparse, RETRIEVAL_CANDIDATES)
-
-  const candidates = results.filter((r) => r.score >= MIN_SCORE)
+  const candidates = await retrieveCandidates(question)
 
   if (candidates.length === 0) {
     return {
