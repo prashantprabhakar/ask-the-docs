@@ -15,11 +15,31 @@ interface Message {
   sources?: Source[]
 }
 
+/**
+ * How many recent turns to send verbatim with each request.
+ * Older turns are compressed into the rolling summary instead.
+ */
+const RECENT_WINDOW = 3 // turns (each turn = 1 user + 1 assistant message)
+
+/**
+ * Start summarizing once the conversation exceeds this many turns.
+ * Below the threshold we send full history; above it we send
+ * summary + recent window.
+ */
+const SUMMARY_THRESHOLD = 6 // turns
+
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [expandedSources, setExpandedSources] = useState<Set<number>>(new Set())
+  /** Rolling summary of turns older than the recent window. */
+  const [summary, setSummary] = useState<string>('')
+  /**
+   * How many messages (not turns) are already captured in `summary`.
+   * Prevents re-summarizing the same turns on every response.
+   */
+  const [summarizedUpTo, setSummarizedUpTo] = useState<number>(0)
   const bottomRef = useRef<HTMLDivElement>(null)
 
   const toggleSources = useCallback((index: number) => {
@@ -42,9 +62,11 @@ export default function Home() {
     setInput('')
     setLoading(true)
 
-    // Capture history before adding the new messages — these are the prior turns
-    // the server needs for context. Strip sources (UI-only) down to role + content.
-    const history = messages.map(({ role, content }) => ({ role, content }))
+    // Send only the recent window of turns. Older context is in `summary`.
+    // Stripping sources (UI-only) down to role + content.
+    const history = messages
+      .slice(-(RECENT_WINDOW * 2))
+      .map(({ role, content }) => ({ role, content }))
 
     setMessages((prev) => [...prev, { role: 'user', content: question }])
     setMessages((prev) => [...prev, { role: 'assistant', content: '', sources: [] }])
@@ -53,7 +75,7 @@ export default function Home() {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, history }),
+        body: JSON.stringify({ question, history, summary: summary || undefined }),
       })
 
       const reader = res.body!.getReader()
@@ -103,6 +125,39 @@ export default function Home() {
     } finally {
       setLoading(false)
     }
+
+    // Background summarization — runs after the response is shown, never
+    // blocks the UI. Compresses old turns into the rolling summary so the
+    // next request doesn't need to send the full history.
+    setMessages((current) => {
+      const totalTurns = current.length / 2
+      const windowEnd = current.length - RECENT_WINDOW * 2
+
+      if (totalTurns > SUMMARY_THRESHOLD && windowEnd > summarizedUpTo) {
+        const toSummarize = current
+          .slice(summarizedUpTo, windowEnd)
+          .map(({ role, content }) => ({ role, content }))
+
+        fetch('/api/summarize', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: toSummarize, existingSummary: summary || undefined }),
+        })
+          .then((r) => r.json())
+          .then(({ summary: newSummary }) => {
+            if (newSummary) {
+              setSummary(newSummary)
+              setSummarizedUpTo(windowEnd)
+            }
+          })
+          .catch(() => {
+            // Summarization failed — conversation still works, just without
+            // the updated summary. Old summary remains in place.
+          })
+      }
+
+      return current // no state change here — we just needed access to current
+    })
   }
 
   return (

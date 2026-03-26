@@ -67,16 +67,24 @@ export interface RAGResponse {
  * History comes before the context so the LLM understands what has already
  * been asked and answered before it reads the new evidence.
  */
-function buildPrompt(question: string, contextChunks: string[], history: Message[]): Message[] {
+function buildPrompt(question: string, contextChunks: string[], history: Message[], summary?: string): Message[] {
   const context = contextChunks.join('\n\n---\n\n')
 
-  return [
-    {
-      role: 'system',
-      content: `You are a helpful assistant that answers questions about technical documentation.
+  /**
+   * Append the conversation summary to the system message when present.
+   * Keeping it in the system message (rather than as a fake user/assistant
+   * turn) avoids polluting the conversation structure and is always visible
+   * to the model regardless of how many turns follow.
+   */
+  const systemContent = [
+    `You are a helpful assistant that answers questions about technical documentation.
 Answer ONLY using the provided context. If the context doesn't contain enough information to answer, say so clearly.
 Do not make up information. Be concise and precise.`,
-    },
+    summary ? `Earlier in this conversation: ${summary}` : '',
+  ].filter(Boolean).join('\n\n')
+
+  return [
+    { role: 'system', content: systemContent },
     // Inject prior turns so follow-up questions like "how do I use that with TypeScript?"
     // have the context of what "that" refers to.
     ...history,
@@ -132,7 +140,7 @@ async function retrieveCandidates(question: string) {
  *
  * Retrieve → Re-rank → Augment → Generate
  */
-export async function ragQuery(question: string, history: Message[] = []): Promise<RAGResponse> {
+export async function ragQuery(question: string, history: Message[] = [], summary?: string): Promise<RAGResponse> {
   // Step 1: RETRIEVE — expand query, search variants in parallel, deduplicate
   const candidates = await retrieveCandidates(question)
 
@@ -151,7 +159,7 @@ export async function ragQuery(question: string, history: Message[] = []): Promi
   const trimmedHistory = history.slice(-(HISTORY_TURNS * 2))
 
   // Step 3: AUGMENT — build the prompt with re-ranked context
-  const messages = buildPrompt(question, reranked.map((r) => r.content), trimmedHistory)
+  const messages = buildPrompt(question, reranked.map((r) => r.content), trimmedHistory, summary)
 
   // Step 4: GENERATE — send to LLM and get the answer
   const answer = await llm.chat(messages)
@@ -172,7 +180,7 @@ export async function ragQuery(question: string, history: Message[] = []): Promi
  * Streaming version — yields answer tokens as they arrive.
  * Sources are returned separately after the stream ends.
  */
-export async function ragQueryStream(question: string, history: Message[] = []): Promise<{
+export async function ragQueryStream(question: string, history: Message[] = [], summary?: string): Promise<{
   stream: AsyncIterable<string>
   sources: RetrievedSource[]
 }> {
@@ -188,7 +196,7 @@ export async function ragQueryStream(question: string, history: Message[] = []):
   const reranked = await rerank(question, candidates, TOP_K)
 
   const trimmedHistory = history.slice(-(HISTORY_TURNS * 2))
-  const messages = buildPrompt(question, reranked.map((r) => r.content), trimmedHistory)
+  const messages = buildPrompt(question, reranked.map((r) => r.content), trimmedHistory, summary)
 
   return {
     stream: llm.streamChat(messages),

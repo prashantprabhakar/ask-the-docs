@@ -3,13 +3,13 @@ import { NextRequest } from 'next/server'
 import { ragQueryStream } from '@/lib/rag/retriever'
 
 export async function POST(req: NextRequest) {
-  const { question, history = [] } = await req.json()
+  const { question, history = [], summary } = await req.json()
 
   if (!question?.trim()) {
     return new Response('Missing question', { status: 400 })
   }
 
-  const { stream, sources } = await ragQueryStream(question, history)
+  const { stream, sources } = await ragQueryStream(question, history, summary)
 
   // Server-Sent Events — streams tokens to the UI as they arrive
   const encoder = new TextEncoder()
