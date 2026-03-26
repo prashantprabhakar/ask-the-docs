@@ -6,6 +6,7 @@ import { upsertChunks, chunkId, deleteChunksBySource, scrollAllChunkTexts } from
 import { encodeSparse, tokenize, reloadIdfTable } from './sparse-encoder'
 import { buildIdfTable, saveIdfTable } from './idf-table'
 import { loadCache, saveCache, hashFileContent } from './ingest-cache'
+import { generateContextPrefix } from './context-builder'
 import type { RawDocument } from './chunker'
 import type { DocChunk } from '../vectordb'
 
@@ -73,20 +74,53 @@ async function embedAndStore(doc: RawDocument): Promise<number> {
   const chunks = await chunkDocument(doc)
   if (chunks.length === 0) return 0
 
+  /**
+   * Contextual retrieval — prepend an LLM-generated context sentence to each
+   * chunk before embedding. This makes ambiguous chunks retrievable.
+   *
+   * Example — without context the embedding of:
+   *   "App Router > Image > Lazy Loading\n\nThe default value is `true`."
+   * won't match "is lazy loading enabled by default?" well.
+   *
+   * With context:
+   *   "This chunk describes the default lazy loading setting for next/image.\n\n
+   *    App Router > Image > Lazy Loading\n\nThe default value is `true`."
+   * the embedding is anchored to the right concept.
+   *
+   * Context is generated sequentially (one LLM call per chunk). Ingest is
+   * already a background script so latency here doesn't affect query time.
+   * Incremental ingest means this runs only for new or changed chunks.
+   *
+   * PROD NOTE — To speed up large ingests, generate context in parallel with
+   *   a concurrency limit (p-limit). Keep the limit low enough to avoid
+   *   overloading the LLM provider's rate limits.
+   */
+  const contextualContents: string[] = []
+  for (const chunk of chunks) {
+    const context = await generateContextPrefix(doc.title, chunk.sectionTitle, chunk.content)
+    const withContext = context ? `${context}\n\n${chunk.content}` : chunk.content
+    contextualContents.push(withContext)
+  }
+
   for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
     const batch = chunks.slice(i, i + BATCH_SIZE)
-    const embeddings = await embedder.embedBatch(batch.map((c) => c.content))
+    const batchContents = contextualContents.slice(i, i + BATCH_SIZE)
+    const embeddings = await embedder.embedBatch(batchContents)
 
     const docChunks: DocChunk[] = batch.map((chunk, j) => ({
       /**
        * Content-addressed UUID v5.
        * Same content = same ID → upsert is idempotent.
        * Changed content = new ID → old chunk was already deleted by deleteChunksBySource.
+       *
+       * NOTE — We hash the contextual content (with prefix), not the raw chunk.
+       * If the context generation output changes (e.g. prompt update), the hash
+       * changes and the chunk is re-embedded on the next full ingest.
        */
-      id: chunkId(chunk.source, chunk.content),
-      content: chunk.content,
+      id: chunkId(chunk.source, batchContents[j]),
+      content: batchContents[j],
       embedding: embeddings[j],
-      sparseVector: encodeSparse(chunk.content),
+      sparseVector: encodeSparse(batchContents[j]),
       metadata: {
         source: chunk.source,
         title: chunk.title,
