@@ -1,5 +1,6 @@
 import { createEmbeddingClient, createLLMClient } from '../llm/factory'
 import { similaritySearch } from '../vectordb'
+import type { ChunkFilter } from '../vectordb'
 import { encodeSparse } from './sparse-encoder'
 import { rerank } from './reranker'
 import { expandQuery } from './query-expander'
@@ -47,6 +48,7 @@ export interface RetrievedSource {
   title: string
   sectionTitle: string
   source: string
+  url: string
   score: number
   excerpt: string
 }
@@ -114,14 +116,14 @@ Question: ${question}`,
  *   - embedBatch encodes all variants in one call
  *   - N similaritySearch calls run in parallel (one per variant)
  */
-async function retrieveCandidates(question: string) {
+async function retrieveCandidates(question: string, filter?: ChunkFilter) {
   // Expand the query and embed all variants in a single batch call
   const queries = await expandQuery(question)
   const embeddings = await embedder.embedBatch(queries)
 
-  // Parallel search — one per query variant
+  // Parallel search — one per query variant, filter applied to all
   const allResults = await Promise.all(
-    queries.map((q, i) => similaritySearch(embeddings[i], encodeSparse(q), RETRIEVAL_CANDIDATES))
+    queries.map((q, i) => similaritySearch(embeddings[i], encodeSparse(q), RETRIEVAL_CANDIDATES, filter))
   )
 
   // Deduplicate by content — first-seen wins
@@ -140,9 +142,9 @@ async function retrieveCandidates(question: string) {
  *
  * Retrieve → Re-rank → Augment → Generate
  */
-export async function ragQuery(question: string, history: Message[] = [], summary?: string): Promise<RAGResponse> {
+export async function ragQuery(question: string, history: Message[] = [], summary?: string, filter?: ChunkFilter): Promise<RAGResponse> {
   // Step 1: RETRIEVE — expand query, search variants in parallel, deduplicate
-  const candidates = await retrieveCandidates(question)
+  const candidates = await retrieveCandidates(question, filter)
 
   if (candidates.length === 0) {
     return {
@@ -170,6 +172,7 @@ export async function ragQuery(question: string, history: Message[] = [], summar
       title: r.metadata.title,
       sectionTitle: r.metadata.sectionTitle,
       source: r.metadata.source,
+      url: r.metadata.url,
       score: r.rerankScore,
       excerpt: r.content.slice(0, 200) + '...',
     })),
@@ -180,11 +183,11 @@ export async function ragQuery(question: string, history: Message[] = [], summar
  * Streaming version — yields answer tokens as they arrive.
  * Sources are returned separately after the stream ends.
  */
-export async function ragQueryStream(question: string, history: Message[] = [], summary?: string): Promise<{
+export async function ragQueryStream(question: string, history: Message[] = [], summary?: string, filter?: ChunkFilter): Promise<{
   stream: AsyncIterable<string>
   sources: RetrievedSource[]
 }> {
-  const candidates = await retrieveCandidates(question)
+  const candidates = await retrieveCandidates(question, filter)
 
   if (candidates.length === 0) {
     return {
@@ -204,6 +207,7 @@ export async function ragQueryStream(question: string, history: Message[] = [], 
       title: r.metadata.title,
       sectionTitle: r.metadata.sectionTitle,
       source: r.metadata.source,
+      url: r.metadata.url,
       score: r.rerankScore,
       excerpt: r.content.slice(0, 200) + '...',
     })),

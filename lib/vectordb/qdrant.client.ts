@@ -67,6 +67,8 @@ const client = new QdrantClient({
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+export type DocType = 'guide' | 'api-reference' | 'error'
+
 export interface DocChunk {
   /**
    * Deterministic UUID v5 derived from source path + content.
@@ -83,14 +85,21 @@ export interface DocChunk {
     title: string         // document title (from first # heading)
     sectionTitle: string  // full heading path, e.g. "App Router > Layouts > Nested Layouts"
     chunkIndex: number    // position within the section (0 if section fits in one chunk)
-    /**
-     * PROD NOTE — Also add:
-     *   lastModified: string  (ISO date — lets you surface freshness to the user)
-     *   docType: string       ("guide" | "api-reference" | "changelog")
-     *   url: string           (link to live docs for citation)
-     * These unlock filtered search and freshness-aware ranking later.
-     */
+    lastModified: string  // ISO 8601 — file mtime at ingest time, surfaces doc freshness
+    docType: DocType      // inferred from path — enables filtered search by doc type
+    url: string           // canonical nextjs.org URL for this section (for citations)
   }
+}
+
+/**
+ * Caller-facing filter — subset of what the user can restrict search to.
+ * Converted to a Qdrant payload filter inside similaritySearch.
+ *
+ * PROD NOTE — Extend this as you add more indexed payload fields.
+ *   Common additions: `sinceDate` (filter by lastModified), `source` (specific file).
+ */
+export interface ChunkFilter {
+  docType?: DocType
 }
 
 // ─── ID Generation ────────────────────────────────────────────────────────────
@@ -180,7 +189,20 @@ async function ensureCollection() {
       field_name: 'metadata.source',
       field_schema: 'keyword',
     })
-    console.log('Created payload index on metadata.source')
+
+    /**
+     * Index metadata.docType so filtered searches (e.g. "only guide chunks")
+     * hit an inverted index instead of scanning every point's payload.
+     *
+     * PROD NOTE — Add an index for every field you filter on. Without an index
+     *   Qdrant falls back to a full payload scan — O(N) per query.
+     */
+    await client.createPayloadIndex(COLLECTION, {
+      field_name: 'metadata.docType',
+      field_schema: 'keyword',
+    })
+
+    console.log('Created payload indexes on metadata.source, metadata.docType')
   }
 
   collectionReady = true
@@ -279,11 +301,29 @@ export async function upsertChunks(chunks: DocChunk[]): Promise<void> {
 export async function similaritySearch(
   queryEmbedding: number[],
   querySparse: SparseVector,
-  topK = 5
+  topK = 5,
+  filter?: ChunkFilter
 ): Promise<{ content: string; metadata: DocChunk['metadata']; score: number }[]> {
   await ensureCollection()
 
   const PREFETCH_LIMIT = 20
+
+  /**
+   * Convert the caller-facing ChunkFilter into Qdrant's payload filter format.
+   *
+   * LEARN — Qdrant payload filters:
+   *   Applied BEFORE vector scoring — Qdrant only scores points that pass the
+   *   filter. This makes filtered search cheaper, not more expensive: fewer
+   *   points to score, and the indexed keyword lookup is O(1).
+   *
+   *   `must` = AND (all conditions must match)
+   *   `should` = OR (any condition must match)
+   *   `must_not` = NOT
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const qdrantFilter: any = filter?.docType
+    ? { must: [{ key: 'metadata.docType', match: { value: filter.docType } }] }
+    : undefined
 
   const results = await withRetry(() =>
     client.query(COLLECTION, {
@@ -296,11 +336,13 @@ export async function similaritySearch(
           query: queryEmbedding,
           using: DENSE_VECTOR,
           limit: PREFETCH_LIMIT,
+          ...(qdrantFilter && { filter: qdrantFilter }),
         },
         {
           query: querySparse,
           using: SPARSE_VECTOR,
           limit: PREFETCH_LIMIT,
+          ...(qdrantFilter && { filter: qdrantFilter }),
         },
       ],
       /**

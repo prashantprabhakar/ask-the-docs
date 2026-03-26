@@ -5,6 +5,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 interface Source {
   title: string
   source: string
+  url: string
   score: number
   excerpt: string
 }
@@ -33,6 +34,8 @@ export default function Home() {
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [expandedSources, setExpandedSources] = useState<Set<number>>(new Set())
+  /** Active doc type filter — undefined means search all docs. */
+  const [docTypeFilter, setDocTypeFilter] = useState<'guide' | 'api-reference' | undefined>(undefined)
   /** Rolling summary of turns older than the recent window. */
   const [summary, setSummary] = useState<string>('')
   /**
@@ -75,7 +78,12 @@ export default function Home() {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, history, summary: summary || undefined }),
+        body: JSON.stringify({
+          question,
+          history,
+          summary: summary || undefined,
+          filter: docTypeFilter ? { docType: docTypeFilter } : undefined,
+        }),
       })
 
       const reader = res.body!.getReader()
@@ -162,9 +170,26 @@ export default function Home() {
 
   return (
     <div className="flex flex-col h-screen bg-gray-950 text-gray-100">
-      <header className="border-b border-gray-800 px-6 py-4">
-        <h1 className="text-xl font-semibold">Ask the Docs</h1>
-        <p className="text-sm text-gray-400">Next.js documentation — powered by RAG + Ollama</p>
+      <header className="border-b border-gray-800 px-6 py-4 flex items-center justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-semibold">Ask the Docs</h1>
+          <p className="text-sm text-gray-400">Next.js documentation — powered by RAG + Ollama</p>
+        </div>
+        <div className="flex items-center gap-1 text-xs bg-gray-900 rounded-lg p-1 shrink-0">
+          {([undefined, 'guide', 'api-reference'] as const).map((type) => (
+            <button
+              key={type ?? 'all'}
+              onClick={() => setDocTypeFilter(type)}
+              className={`px-3 py-1.5 rounded-md transition-colors ${
+                docTypeFilter === type
+                  ? 'bg-blue-600 text-white'
+                  : 'text-gray-400 hover:text-gray-200'
+              }`}
+            >
+              {type === undefined ? 'All' : type === 'guide' ? 'Guides' : 'API Ref'}
+            </button>
+          ))}
+        </div>
       </header>
 
       <div className="flex-1 overflow-y-auto px-4 py-6 space-y-6 max-w-3xl mx-auto w-full">
@@ -219,7 +244,14 @@ export default function Home() {
                             </span>
                           </div>
                           <p className="text-xs text-gray-400 line-clamp-2">{src.excerpt}</p>
-                          <p className="text-xs text-gray-600 mt-1 font-mono">{src.source}</p>
+                          <a
+                            href={src.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs text-gray-600 hover:text-blue-400 mt-1 font-mono block truncate transition-colors"
+                          >
+                            {src.source}
+                          </a>
                         </div>
                       ))}
                     </div>

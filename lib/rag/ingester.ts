@@ -1,5 +1,6 @@
 import fs from 'fs'
 import path from 'path'
+import type { DocType } from '../vectordb'
 import { createEmbeddingClient } from '../llm/factory'
 import { chunkDocument } from './chunker'
 import { upsertChunks, chunkId, deleteChunksBySource, scrollAllChunkTexts } from '../vectordb'
@@ -58,6 +59,45 @@ function toSource(filePath: string, dir: string): string {
   return path.relative(dir, filePath).replace(/\\/g, '/') // normalize to forward slashes
 }
 
+/**
+ * Infer the documentation type from the source path.
+ *
+ * Next.js docs structure:
+ *   - paths containing "api-reference" → API reference pages
+ *   - paths containing "error" → error explanation pages
+ *   - everything else → conceptual guides and tutorials
+ *
+ * PROD NOTE — Extend this as your doc set grows. A config map
+ *   ({ pattern, docType }[]) scales better than if/else chains.
+ */
+function inferDocType(source: string): DocType {
+  if (source.includes('api-reference')) return 'api-reference'
+  if (source.includes('error')) return 'error'
+  return 'guide'
+}
+
+/**
+ * Build the canonical nextjs.org URL for a doc source path.
+ *
+ * Source paths use numeric prefixes for filesystem ordering:
+ *   "02-app/01-building-your-application/01-routing/01-defining-routes.mdx"
+ *
+ * Canonical URL strips those prefixes:
+ *   "https://nextjs.org/docs/app/building-your-application/routing/defining-routes"
+ *
+ * Steps:
+ *   1. Strip file extension
+ *   2. Strip trailing "/index" (directory index pages)
+ *   3. Remove numeric sort prefixes (/01-foo → /foo, leading 01-foo → foo)
+ */
+function buildDocsUrl(source: string): string {
+  const withoutExt = source.replace(/\.(md|mdx|txt)$/, '')
+  const withoutIndex = withoutExt.replace(/\/index$/, '')
+  // Replace both leading and mid-path numeric prefixes: "01-foo" → "foo"
+  const withoutPrefixes = withoutIndex.replace(/(^|\/)(\d+-)/g, '$1')
+  return `https://nextjs.org/docs/${withoutPrefixes}`
+}
+
 function loadRawDocument(filePath: string, source: string): RawDocument {
   const content = fs.readFileSync(filePath, 'utf-8')
   const titleMatch = content.match(/^#\s+(.+)/m)
@@ -70,7 +110,7 @@ function loadRawDocument(filePath: string, source: string): RawDocument {
 
 // ─── Per-file Embed + Store ───────────────────────────────────────────────────
 
-async function embedAndStore(doc: RawDocument): Promise<number> {
+async function embedAndStore(doc: RawDocument, filePath: string): Promise<number> {
   const chunks = await chunkDocument(doc)
   if (chunks.length === 0) return 0
 
@@ -126,12 +166,9 @@ async function embedAndStore(doc: RawDocument): Promise<number> {
         title: chunk.title,
         sectionTitle: chunk.sectionTitle,
         chunkIndex: chunk.chunkIndex,
-        /**
-         * PROD NOTE — Add here:
-         *   lastModified: fs.statSync(filePath).mtime.toISOString()
-         *   docType: inferDocType(chunk.source)
-         *   url: buildDocsUrl(chunk.source)
-         */
+        lastModified: fs.statSync(filePath).mtime.toISOString(),
+        docType: inferDocType(chunk.source),
+        url: buildDocsUrl(chunk.source),
       },
     }))
 
@@ -232,7 +269,7 @@ export async function ingestDocuments(dir: string, options: IngestOptions = {}) 
     await deleteChunksBySource(source)
 
     const doc = loadRawDocument(filePath, source)
-    const chunks = await embedAndStore(doc)
+    const chunks = await embedAndStore(doc, filePath)
 
     totalChunks += chunks
     processed++
