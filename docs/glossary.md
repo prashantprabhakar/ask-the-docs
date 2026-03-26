@@ -39,6 +39,11 @@ The number of documents (chunks) in the corpus that contain a given term. Used i
 
 ---
 
+**@xenova/transformers**
+A JavaScript/TypeScript port of Hugging Face's `transformers` Python library. Runs transformer models directly in Node.js using the ONNX Runtime — no Python process, no API key, no GPU required. Models are downloaded from Hugging Face on first use and cached on disk. In this project it powers the cross-encoder re-ranker. The `Xenova/` namespace on Hugging Face hosts pre-converted ONNX versions of popular models.
+
+---
+
 **HyDE** (Hypothetical Document Embeddings)
 A query expansion technique where instead of embedding the raw user question, an LLM first writes a hypothetical answer to the question. That hypothetical answer is then embedded and used for retrieval. The hypothesis lives in the same semantic space as real documents, so it often retrieves better than the short, keyword-heavy original question.
 
@@ -66,6 +71,11 @@ A data structure that maps each term to the list of documents containing it. The
 
 **HNSW** (Hierarchical Navigable Small World)
 A graph-based index structure for approximate nearest-neighbour search. Organises vectors in a layered graph so that search skips most of the corpus and only inspects promising candidates. Makes dense vector search O(log n) rather than O(n). Used by Qdrant for dense vector indexing.
+
+---
+
+**ONNX** (Open Neural Network Exchange)
+A standard open file format for ML models — like a PDF, but for neural networks. A model trained in PyTorch or TensorFlow can be exported to `.onnx`, and any ONNX Runtime (available for Python, Node.js, C++, browsers, mobile) can load and execute it. This portability is why `@xenova/transformers` can run Hugging Face models in Node.js: the models are pre-exported to ONNX format and shipped as static files. No framework-specific code is needed at inference time.
 
 ---
 

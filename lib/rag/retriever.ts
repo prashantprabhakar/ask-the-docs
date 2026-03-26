@@ -1,6 +1,7 @@
 import { createEmbeddingClient, createLLMClient } from '../llm/factory'
 import { similaritySearch } from '../vectordb'
 import { encodeSparse } from './sparse-encoder'
+import { rerank } from './reranker'
 import type { Message } from '../llm/types'
 
 const embedder = createEmbeddingClient()
@@ -18,6 +19,18 @@ const llm = createLLMClient()
  *   against your actual score distributions, not against intuition.
  */
 const MIN_SCORE = 0.01
+
+/**
+ * How many candidates to retrieve from hybrid search before re-ranking.
+ * Larger = better recall for the re-ranker to work with, at the cost of more
+ * cross-encoder forward passes. 20 is a common production default.
+ */
+const RETRIEVAL_CANDIDATES = 20
+
+/**
+ * How many top-ranked chunks to include in the prompt after re-ranking.
+ */
+const TOP_K = 5
 
 /**
  * How many prior conversation turns to include in the prompt.
@@ -88,33 +101,38 @@ export async function ragQuery(question: string, history: Message[] = []): Promi
   // Step 1: RETRIEVE — embed the question and search for similar chunks
   const queryEmbedding = await embedder.embed(question)
   const querySparse = encodeSparse(question)
-  const results = await similaritySearch(queryEmbedding, querySparse, 5)
+  const results = await similaritySearch(queryEmbedding, querySparse, RETRIEVAL_CANDIDATES)
 
-  // Drop chunks below the score threshold — don't send noise to the LLM
-  const relevant = results.filter((r) => r.score >= MIN_SCORE)
+  // Drop chunks below the score threshold — don't send noise to the re-ranker
+  const candidates = results.filter((r) => r.score >= MIN_SCORE)
 
-  if (relevant.length === 0) {
+  if (candidates.length === 0) {
     return {
       answer: "I couldn't find any relevant information in the documentation.",
       sources: [],
     }
   }
 
+  // Step 2: RE-RANK — cross-encoder scores each (question, chunk) pair
+  // and re-orders by fine-grained relevance. This improves precision over
+  // the bi-encoder scores returned by hybrid search.
+  const reranked = await rerank(question, candidates, TOP_K)
+
   const trimmedHistory = history.slice(-(HISTORY_TURNS * 2))
 
-  // Step 2: AUGMENT — build the prompt with retrieved context
-  const messages = buildPrompt(question, relevant.map((r) => r.content), trimmedHistory)
+  // Step 3: AUGMENT — build the prompt with re-ranked context
+  const messages = buildPrompt(question, reranked.map((r) => r.content), trimmedHistory)
 
-  // Step 3: GENERATE — send to LLM and get the answer
+  // Step 4: GENERATE — send to LLM and get the answer
   const answer = await llm.chat(messages)
 
   return {
     answer,
-    sources: relevant.map((r) => ({
+    sources: reranked.map((r) => ({
       title: r.metadata.title,
       sectionTitle: r.metadata.sectionTitle,
       source: r.metadata.source,
-      score: r.score,
+      score: r.rerankScore,
       excerpt: r.content.slice(0, 200) + '...',
     })),
   }
@@ -130,27 +148,29 @@ export async function ragQueryStream(question: string, history: Message[] = []):
 }> {
   const queryEmbedding = await embedder.embed(question)
   const querySparse = encodeSparse(question)
-  const results = await similaritySearch(queryEmbedding, querySparse, 5)
+  const results = await similaritySearch(queryEmbedding, querySparse, RETRIEVAL_CANDIDATES)
 
-  const relevant = results.filter((r) => r.score >= MIN_SCORE)
+  const candidates = results.filter((r) => r.score >= MIN_SCORE)
 
-  if (relevant.length === 0) {
+  if (candidates.length === 0) {
     return {
       stream: (async function* () { yield "I couldn't find any relevant information in the documentation." })(),
       sources: [],
     }
   }
 
+  const reranked = await rerank(question, candidates, TOP_K)
+
   const trimmedHistory = history.slice(-(HISTORY_TURNS * 2))
-  const messages = buildPrompt(question, relevant.map((r) => r.content), trimmedHistory)
+  const messages = buildPrompt(question, reranked.map((r) => r.content), trimmedHistory)
 
   return {
     stream: llm.streamChat(messages),
-    sources: relevant.map((r) => ({
+    sources: reranked.map((r) => ({
       title: r.metadata.title,
       sectionTitle: r.metadata.sectionTitle,
       source: r.metadata.source,
-      score: r.score,
+      score: r.rerankScore,
       excerpt: r.content.slice(0, 200) + '...',
     })),
   }
