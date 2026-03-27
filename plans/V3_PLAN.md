@@ -327,6 +327,52 @@ re-embedding expensive.
 
 ---
 
+## Problem 13: Context generation is sequential — ingest takes 15+ minutes with no timing visibility
+
+**Current:** `embedAndStore` generates a context prefix for each chunk one at a time
+(`ingester.ts:139-143`). Each call is an LLM round-trip — ~1–3 s on Ollama. With 15 chunks
+per file and hundreds of files, this dominates ingest time. There is also no per-stage timing
+output, so it is impossible to know which step is slow without a profiler.
+
+**Why it matters:** A full ingest that takes 15+ minutes discourages doc updates and makes
+debugging retrieval quality painful.
+
+**V3 fix: Parallel context generation with `p-limit` + ingest timing**
+
+Replace the sequential loop with concurrent calls controlled by a semaphore:
+
+```ts
+import pLimit from 'p-limit'
+
+const limit = pLimit(Number(process.env.CONTEXT_CONCURRENCY ?? 3))
+
+const contextualContents = await Promise.all(
+  chunks.map((chunk) =>
+    limit(async () => {
+      const ctx = await generateContextPrefix(doc.title, chunk.sectionTitle, chunk.content)
+      return ctx ? `${ctx}\n\n${chunk.content}` : chunk.content
+    })
+  )
+)
+```
+
+Default concurrency:
+- Ollama local: `3` (CPU/GPU bound — higher values thrash the model server)
+- OpenAI/GitHub API: `20` (network-bound — set via `CONTEXT_CONCURRENCY=20`)
+
+Add wall-clock timing at each stage so slow steps are visible in the output:
+```
+[install.mdx] context: 4.2s | embed: 0.8s | upsert: 0.2s → 18 chunks
+=== Ingestion complete in 3m 12s ===
+```
+
+**Files to change:**
+- `lib/rag/ingester.ts` — parallel context loop + per-file and total timing
+- `package.json` — add `p-limit` as a direct dependency
+- `.env.example` — document `CONTEXT_CONCURRENCY`
+
+---
+
 ## V3 File Changes
 
 ```

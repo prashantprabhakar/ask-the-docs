@@ -1,5 +1,6 @@
 import fs from 'fs'
 import path from 'path'
+import pLimit from 'p-limit'
 import type { DocType } from '../vectordb'
 import { createEmbeddingClient } from '../llm/factory'
 import { chunkDocument } from './chunker'
@@ -29,6 +30,13 @@ const embedder = createEmbeddingClient()
  *   (p-limit) rather than sequentially.
  */
 const BATCH_SIZE = 10
+
+/**
+ * Max concurrent LLM calls for context prefix generation within a single file.
+ * Ollama (local): keep low — model server is CPU/GPU bound, higher values thrash it.
+ * OpenAI/GitHub API: bump to 20 via CONTEXT_CONCURRENCY env var.
+ */
+const CONTEXT_CONCURRENCY = Number(process.env.CONTEXT_CONCURRENCY ?? 3)
 
 // ─── File Walking ─────────────────────────────────────────────────────────────
 
@@ -127,21 +135,27 @@ async function embedAndStore(doc: RawDocument, filePath: string): Promise<number
    *    App Router > Image > Lazy Loading\n\nThe default value is `true`."
    * the embedding is anchored to the right concept.
    *
-   * Context is generated sequentially (one LLM call per chunk). Ingest is
-   * already a background script so latency here doesn't affect query time.
+   * Context is generated concurrently (CONTEXT_CONCURRENCY calls at a time).
+   * Ingest is already a background script so latency here doesn't affect query time.
    * Incremental ingest means this runs only for new or changed chunks.
    *
-   * PROD NOTE — To speed up large ingests, generate context in parallel with
-   *   a concurrency limit (p-limit). Keep the limit low enough to avoid
-   *   overloading the LLM provider's rate limits.
+   * PROD NOTE — Tune CONTEXT_CONCURRENCY per provider:
+   *   Ollama local: 3 (CPU/GPU bound — higher values thrash the model server)
+   *   OpenAI/GitHub API: 20 (network-bound, watch rate limits)
    */
-  const contextualContents: string[] = []
-  for (const chunk of chunks) {
-    const context = await generateContextPrefix(doc.title, chunk.sectionTitle, chunk.content)
-    const withContext = context ? `${context}\n\n${chunk.content}` : chunk.content
-    contextualContents.push(withContext)
-  }
+  const contextLimit = pLimit(CONTEXT_CONCURRENCY)
+  const t0 = Date.now()
+  const contextualContents = await Promise.all(
+    chunks.map((chunk) =>
+      contextLimit(async () => {
+        const context = await generateContextPrefix(doc.title, chunk.sectionTitle, chunk.content)
+        return context ? `${context}\n\n${chunk.content}` : chunk.content
+      })
+    )
+  )
+  const contextMs = Date.now() - t0
 
+  const t1 = Date.now()
   for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
     const batch = chunks.slice(i, i + BATCH_SIZE)
     const batchContents = contextualContents.slice(i, i + BATCH_SIZE)
@@ -174,7 +188,9 @@ async function embedAndStore(doc: RawDocument, filePath: string): Promise<number
 
     await upsertChunks(docChunks)
   }
+  const embedUpsertMs = Date.now() - t1
 
+  process.stdout.write(`    context: ${(contextMs / 1000).toFixed(1)}s | embed+upsert: ${(embedUpsertMs / 1000).toFixed(1)}s\n`)
   return chunks.length
 }
 
@@ -213,6 +229,7 @@ export interface IngestOptions {
  *   it done. The cache then lives in a shared DB, not a local JSON file.
  */
 export async function ingestDocuments(dir: string, options: IngestOptions = {}) {
+  const ingestStart = Date.now()
   console.log(`\n=== Starting ${options.full ? 'full' : 'incremental'} ingestion ===\n`)
 
   const allFiles = walkFiles(dir)
@@ -301,9 +318,11 @@ export async function ingestDocuments(dir: string, options: IngestOptions = {}) 
     console.log('No chunks in store — IDF table not built.')
   }
 
+  const totalSec = ((Date.now() - ingestStart) / 1000).toFixed(1)
   console.log('\n=== Ingestion complete ===')
   console.log(`Files processed : ${processed}`)
   console.log(`Files skipped   : ${skipped} (unchanged)`)
   console.log(`Files deleted   : ${deletedSources.length}`)
   console.log(`Chunks embedded : ${totalChunks}`)
+  console.log(`Total time      : ${totalSec}s`)
 }
