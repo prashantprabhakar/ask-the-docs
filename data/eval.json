@@ -1,0 +1,80 @@
+[
+  {
+    "question": "How do I create a new Next.js project?",
+    "expected_sources": ["01-app/01-getting-started/01-installation.mdx"],
+    "notes": "Should mention create-next-app and Node.js version requirement"
+  },
+  {
+    "question": "How do I create layouts and pages in the App Router?",
+    "expected_sources": ["01-app/01-getting-started/03-layouts-and-pages.mdx"],
+    "notes": "Should explain layout.tsx and page.tsx file conventions"
+  },
+  {
+    "question": "What is the difference between Server Components and Client Components?",
+    "expected_sources": ["01-app/01-getting-started/05-server-and-client-components.mdx"],
+    "notes": "Should mention the 'use client' directive and rendering boundary"
+  },
+  {
+    "question": "How do I fetch data in a Server Component?",
+    "expected_sources": ["01-app/01-getting-started/06-fetching-data.mdx"],
+    "notes": "Should cover async Server Components and fetch"
+  },
+  {
+    "question": "How do I mutate data with Server Actions?",
+    "expected_sources": ["01-app/01-getting-started/07-mutating-data.mdx"],
+    "notes": "Should mention 'use server' directive and form actions"
+  },
+  {
+    "question": "How does caching work in the Next.js App Router?",
+    "expected_sources": ["01-app/01-getting-started/08-caching.mdx"],
+    "notes": "Should describe the caching layers"
+  },
+  {
+    "question": "How do I handle errors in Next.js?",
+    "expected_sources": ["01-app/01-getting-started/10-error-handling.mdx"],
+    "notes": "Should mention error.tsx boundary file"
+  },
+  {
+    "question": "How do I optimize images in Next.js?",
+    "expected_sources": [
+      "01-app/01-getting-started/12-images.mdx",
+      "01-app/03-api-reference/02-components/image.mdx"
+    ],
+    "notes": "Should mention next/image component"
+  },
+  {
+    "question": "How do I use custom fonts in Next.js?",
+    "expected_sources": ["01-app/01-getting-started/13-fonts.mdx"],
+    "notes": "Should mention next/font and Google Fonts"
+  },
+  {
+    "question": "How do I create API route handlers in Next.js?",
+    "expected_sources": ["01-app/01-getting-started/15-route-handlers.mdx"],
+    "notes": "Should explain route.ts files and HTTP methods"
+  },
+  {
+    "question": "What does the 'use client' directive do?",
+    "expected_sources": ["01-app/03-api-reference/01-directives/use-client.mdx"],
+    "notes": "Should explain the client boundary"
+  },
+  {
+    "question": "How do I use environment variables in Next.js?",
+    "expected_sources": ["01-app/02-guides/environment-variables.mdx"],
+    "notes": "Should mention .env files and NEXT_PUBLIC_ prefix"
+  },
+  {
+    "question": "How do I add authentication to a Next.js app?",
+    "expected_sources": ["01-app/02-guides/authentication.mdx"],
+    "notes": "Should cover session management and middleware"
+  },
+  {
+    "question": "What is Incremental Static Regeneration (ISR)?",
+    "expected_sources": ["01-app/02-guides/incremental-static-regeneration.mdx"],
+    "notes": "Should explain revalidation and stale-while-revalidate"
+  },
+  {
+    "question": "How do I use the Link component for client-side navigation?",
+    "expected_sources": ["01-app/03-api-reference/02-components/link.mdx"],
+    "notes": "Should mention the href prop and prefetching"
+  }
+]
