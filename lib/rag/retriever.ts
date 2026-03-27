@@ -4,6 +4,7 @@ import type { ChunkFilter } from '../vectordb'
 import { encodeSparse } from './sparse-encoder'
 import { rerank } from './reranker'
 import { expandQuery } from './query-expander'
+import { logger } from '../logger'
 import type { Message } from '../llm/types'
 
 const embedder = createEmbeddingClient()
@@ -110,23 +111,26 @@ Question: ${question}`,
  * Deduplication key: chunk content. If the same chunk is returned by multiple
  * query variants, only the first occurrence is kept (scores are discarded
  * before re-ranking anyway — the cross-encoder re-scores everything).
- *
- * Expansion + parallel search run concurrently with Promise.all:
- *   - expandQuery fires the LLM for variants
- *   - embedBatch encodes all variants in one call
- *   - N similaritySearch calls run in parallel (one per variant)
  */
-async function retrieveCandidates(question: string, filter?: ChunkFilter) {
-  // Expand the query and embed all variants in a single batch call
+async function retrieveCandidates(question: string, requestId: string, filter?: ChunkFilter) {
+  // ── Query expansion ────────────────────────────────────────────────────────
+  const expandElapsed = logger.timer()
   const queries = await expandQuery(question)
-  const embeddings = await embedder.embedBatch(queries)
+  logger.info({ requestId, event: 'query_expand', queryCount: queries.length, durationMs: expandElapsed() })
 
-  // Parallel search — one per query variant, filter applied to all
+  // ── Embedding ──────────────────────────────────────────────────────────────
+  const embedElapsed = logger.timer()
+  const embeddings = await embedder.embedBatch(queries)
+  logger.info({ requestId, event: 'embed', queryCount: queries.length, durationMs: embedElapsed() })
+
+  // ── Parallel search ────────────────────────────────────────────────────────
+  const searchElapsed = logger.timer()
   const allResults = await Promise.all(
     queries.map((q, i) => similaritySearch(embeddings[i], encodeSparse(q), RETRIEVAL_CANDIDATES, filter))
   )
+  logger.info({ requestId, event: 'search', queryCount: queries.length, durationMs: searchElapsed() })
 
-  // Deduplicate by content — first-seen wins
+  // ── Deduplicate ────────────────────────────────────────────────────────────
   const seen = new Set<string>()
   const merged = allResults.flat().filter((r) => {
     if (seen.has(r.content)) return false
@@ -134,7 +138,10 @@ async function retrieveCandidates(question: string, filter?: ChunkFilter) {
     return true
   })
 
-  return merged.filter((r) => r.score >= MIN_SCORE)
+  const candidates = merged.filter((r) => r.score >= MIN_SCORE)
+  logger.info({ requestId, event: 'candidates', total: merged.length, aboveThreshold: candidates.length })
+
+  return candidates
 }
 
 /**
@@ -143,10 +150,14 @@ async function retrieveCandidates(question: string, filter?: ChunkFilter) {
  * Retrieve → Re-rank → Augment → Generate
  */
 export async function ragQuery(question: string, history: Message[] = [], summary?: string, filter?: ChunkFilter): Promise<RAGResponse> {
+  const requestId = crypto.randomUUID()
+  logger.info({ requestId, event: 'request_start', question })
+
   // Step 1: RETRIEVE — expand query, search variants in parallel, deduplicate
-  const candidates = await retrieveCandidates(question, filter)
+  const candidates = await retrieveCandidates(question, requestId, filter)
 
   if (candidates.length === 0) {
+    logger.info({ requestId, event: 'no_candidates' })
     return {
       answer: "I couldn't find any relevant information in the documentation.",
       sources: [],
@@ -154,17 +165,24 @@ export async function ragQuery(question: string, history: Message[] = [], summar
   }
 
   // Step 2: RE-RANK — cross-encoder scores each (question, chunk) pair
-  // and re-orders by fine-grained relevance. This improves precision over
-  // the bi-encoder scores returned by hybrid search.
+  const rerankElapsed = logger.timer()
   const reranked = await rerank(question, candidates, TOP_K)
+  logger.info({
+    requestId,
+    event: 'rerank',
+    candidateCount: candidates.length,
+    topK: reranked.length,
+    scores: reranked.map((r) => r.rerankScore.toFixed(3)),
+    durationMs: rerankElapsed(),
+  })
 
   const trimmedHistory = history.slice(-(HISTORY_TURNS * 2))
-
-  // Step 3: AUGMENT — build the prompt with re-ranked context
   const messages = buildPrompt(question, reranked.map((r) => r.content), trimmedHistory, summary)
 
-  // Step 4: GENERATE — send to LLM and get the answer
+  // Step 3: GENERATE
+  const llmElapsed = logger.timer()
   const answer = await llm.chat(messages)
+  logger.info({ requestId, event: 'llm_complete', durationMs: llmElapsed() })
 
   return {
     answer,
@@ -182,27 +200,64 @@ export async function ragQuery(question: string, history: Message[] = [], summar
 /**
  * Streaming version — yields answer tokens as they arrive.
  * Sources are returned separately after the stream ends.
+ *
+ * The stream is wrapped to track first-token latency — the time from when
+ * the LLM call is made to when the first token arrives over the wire.
+ * This is the metric users feel as "response lag".
  */
 export async function ragQueryStream(question: string, history: Message[] = [], summary?: string, filter?: ChunkFilter): Promise<{
   stream: AsyncIterable<string>
   sources: RetrievedSource[]
 }> {
-  const candidates = await retrieveCandidates(question, filter)
+  const requestId = crypto.randomUUID()
+  logger.info({ requestId, event: 'request_start', question })
+
+  const candidates = await retrieveCandidates(question, requestId, filter)
 
   if (candidates.length === 0) {
+    logger.info({ requestId, event: 'no_candidates' })
     return {
       stream: (async function* () { yield "I couldn't find any relevant information in the documentation." })(),
       sources: [],
     }
   }
 
+  const rerankElapsed = logger.timer()
   const reranked = await rerank(question, candidates, TOP_K)
+  logger.info({
+    requestId,
+    event: 'rerank',
+    candidateCount: candidates.length,
+    topK: reranked.length,
+    scores: reranked.map((r) => r.rerankScore.toFixed(3)),
+    durationMs: rerankElapsed(),
+  })
 
   const trimmedHistory = history.slice(-(HISTORY_TURNS * 2))
   const messages = buildPrompt(question, reranked.map((r) => r.content), trimmedHistory, summary)
 
+  const llmStart = logger.timer()
+  const rawStream = llm.streamChat(messages)
+
+  /**
+   * Wrap the raw stream to measure first-token latency.
+   * First-token latency = time from LLM call to first byte of response.
+   * This is what the user perceives as "time to start reading an answer".
+   */
+  async function* instrumentedStream(): AsyncIterable<string> {
+    let firstToken = true
+    for await (const token of rawStream) {
+      if (firstToken) {
+        logger.info({ requestId, event: 'llm_first_token', durationMs: llmStart() })
+        firstToken = false
+      }
+      yield token
+    }
+    logger.info({ requestId, event: 'llm_complete', durationMs: llmStart() })
+  }
+
   return {
-    stream: llm.streamChat(messages),
+    stream: instrumentedStream(),
     sources: reranked.map((r) => ({
       title: r.metadata.title,
       sectionTitle: r.metadata.sectionTitle,
