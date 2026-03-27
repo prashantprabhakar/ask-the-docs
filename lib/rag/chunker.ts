@@ -46,6 +46,25 @@ const subSplitter = new RecursiveCharacterTextSplitter({
   separators: ['\n\n', '\n', '. ', ' '],
 })
 
+// ─── MDX Pre-processing ───────────────────────────────────────────────────────
+
+/**
+ * Strip YAML front-matter from MDX/Markdown files.
+ *
+ * MDX files often start with a front-matter block:
+ *   ---
+ *   title: "Getting Started"
+ *   description: "..."
+ *   ---
+ *
+ * Without stripping, the first "section" of the document would contain
+ * raw YAML which pollutes the embedding with noise tokens. The title/description
+ * are already captured in the document title extracted separately.
+ */
+function stripFrontMatter(content: string): string {
+  return content.replace(/^---[\s\S]*?---\n/, '')
+}
+
 // ─── Structural Header Splitting ──────────────────────────────────────────────
 
 interface Section {
@@ -63,14 +82,12 @@ interface Section {
  *   - The heading path gives the embedding model context about what the chunk
  *     is about even when the content itself is ambiguous
  *
- * PROD NOTE — In production you'd also handle:
- *   - Front-matter stripping (--- yaml blocks at the top of MDX files)
- *   - Code block preservation (avoid splitting mid-code-block)
- *   - Table preservation (a half-table is useless as a chunk)
- *   Tools like Unstructured.io or Docling handle all of these.
+ * MDX-aware: front-matter is stripped before splitting, and headings inside
+ * code fences are not treated as section boundaries.
  */
 function splitIntoSections(doc: RawDocument): Section[] {
-  const lines = doc.content.split('\n')
+  const content = stripFrontMatter(doc.content)
+  const lines = content.split('\n')
 
   // heading stack tracks the current h1/h2/h3 breadcrumb
   // index 0 = h1, index 1 = h2, index 2 = h3
@@ -78,6 +95,12 @@ function splitIntoSections(doc: RawDocument): Section[] {
   const sections: Section[] = []
 
   let currentLines: string[] = []
+  /**
+   * Track whether we're inside a fenced code block.
+   * Lines that start with ``` toggle this flag.
+   * Heading-like lines (## foo) inside a fence are code content, not headings.
+   */
+  let inCodeBlock = false
 
   const flushSection = () => {
     const text = currentLines.join('\n').trim()
@@ -88,6 +111,20 @@ function splitIntoSections(doc: RawDocument): Section[] {
   }
 
   for (const line of lines) {
+    // Toggle code block state on opening/closing fence.
+    // Use startsWith rather than exact match to handle fences with language hints (```ts).
+    if (line.startsWith('```')) {
+      inCodeBlock = !inCodeBlock
+      currentLines.push(line)
+      continue
+    }
+
+    // Inside a code block — accumulate as content, never as a heading boundary.
+    if (inCodeBlock) {
+      currentLines.push(line)
+      continue
+    }
+
     const h1 = line.match(/^#\s+(.+)/)
     const h2 = line.match(/^##\s+(.+)/)
     const h3 = line.match(/^###\s+(.+)/)
@@ -111,6 +148,68 @@ function splitIntoSections(doc: RawDocument): Section[] {
 
   flushSection()
   return sections
+}
+
+// ─── Table-aware Sub-splitting ────────────────────────────────────────────────
+
+/**
+ * Split a large section into sub-chunks while keeping tables intact.
+ *
+ * PROBLEM — The RecursiveCharacterTextSplitter doesn't understand Markdown
+ * structure. It might split a table in the middle, producing a fragment like:
+ *
+ *   | Option | Default |
+ *   |--------|---------|
+ *   | `lazy` | `true`  |
+ *
+ * and then:
+ *
+ *   | `eager` | `false` |   ← meaningless without the header row
+ *
+ * SOLUTION — Segment the content first, isolating contiguous table blocks
+ * (lines starting with `|`). Tables are kept as single units. Non-table prose
+ * is passed through the character splitter as before.
+ */
+async function splitPreservingTables(content: string): Promise<string[]> {
+  // Segment content into alternating table / prose blocks
+  interface Segment { text: string; isTable: boolean }
+  const segments: Segment[] = []
+  const lines = content.split('\n')
+  let current: string[] = []
+  let inTable = false
+
+  const flushSegment = (wasTable: boolean) => {
+    const text = current.join('\n').trim()
+    if (text) segments.push({ text, isTable: wasTable })
+    current = []
+  }
+
+  for (const line of lines) {
+    const isTableRow = /^\s*\|/.test(line)
+    if (isTableRow !== inTable) {
+      flushSegment(inTable)
+      inTable = isTableRow
+    }
+    current.push(line)
+  }
+  flushSegment(inTable)
+
+  // Collect sub-chunks: tables whole, prose split
+  const results: string[] = []
+  for (const segment of segments) {
+    if (segment.isTable) {
+      // Always keep tables as a single chunk regardless of size.
+      // A split table is worse than a slightly oversized chunk.
+      results.push(segment.text)
+    } else if (segment.text.length <= MAX_CHUNK_SIZE) {
+      results.push(segment.text)
+    } else {
+      const splits = await subSplitter.splitText(segment.text)
+      results.push(...splits)
+    }
+  }
+
+  return results.filter((t) => t.trim().length > 0)
 }
 
 // ─── Contextual Prefix ────────────────────────────────────────────────────────
@@ -155,7 +254,7 @@ export async function chunkDocument(doc: RawDocument): Promise<Chunk[]> {
       })
     } else {
       /**
-       * Section is too large — sub-split it with the character splitter.
+       * Section is too large — sub-split it while preserving tables intact.
        *
        * We sub-split the raw content (without prefix), then add the prefix
        * to each sub-chunk. This avoids the prefix inflating the size check.
@@ -164,7 +263,7 @@ export async function chunkDocument(doc: RawDocument): Promise<Chunk[]> {
        *   matters more than coverage, consider increasing MAX_CHUNK_SIZE to
        *   avoid sub-splitting, or use a sliding window approach instead.
        */
-      const subTexts = await subSplitter.splitText(section.content)
+      const subTexts = await splitPreservingTables(section.content)
       subTexts.forEach((text, i) => {
         chunks.push({
           content: withSectionPrefix(section.headingPath, text),
