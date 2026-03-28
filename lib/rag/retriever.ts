@@ -6,44 +6,15 @@ import { rerank } from './reranker'
 import { expandQuery } from './query-expander'
 import { logger } from '../logger'
 import type { Message } from '../llm/types'
+import { retrieval as retrievalConfig } from '../config'
 
 const embedder = createEmbeddingClient()
 const llm = createLLMClient()
 
-/**
- * Chunks below this score are considered irrelevant and dropped before building
- * the prompt. Without this, Qdrant always returns topK results even when none
- * are relevant — and the LLM will hallucinate an answer from the noise.
- *
- * PROD NOTE — This value is empirical. Tune it by running known-irrelevant
- *   queries, observing their scores, and setting the threshold just above them.
- *   RRF scores are not cosine similarities — they are rank-derived and typically
- *   much smaller (often 0.01–0.05 range), so the threshold must be calibrated
- *   against your actual score distributions, not against intuition.
- */
-const MIN_SCORE = 0.01
-
-/**
- * How many candidates to retrieve from hybrid search before re-ranking.
- * Larger = better recall for the re-ranker to work with, at the cost of more
- * cross-encoder forward passes. 20 is a common production default.
- */
-const RETRIEVAL_CANDIDATES = 20
-
-/**
- * How many top-ranked chunks to include in the prompt after re-ranking.
- */
-const TOP_K = 5
-
-/**
- * How many prior conversation turns to include in the prompt.
- * Each turn = one user message + one assistant message.
- * More turns = better follow-up handling, larger prompt, more tokens.
- *
- * PROD NOTE — In production you would also summarize old turns rather than
- *   truncating them, so the LLM retains context from early in a long session.
- */
-const HISTORY_TURNS = 3
+const MIN_SCORE = retrievalConfig.minScore
+const RETRIEVAL_CANDIDATES = retrievalConfig.candidates
+const TOP_K = retrievalConfig.topK
+const HISTORY_TURNS = retrievalConfig.historyTurns
 
 export interface RetrievedSource {
   title: string
@@ -192,7 +163,7 @@ export async function ragQuery(question: string, history: Message[] = [], summar
       source: r.metadata.source,
       url: r.metadata.url,
       score: r.rerankScore,
-      excerpt: r.content.slice(0, 200) + '...',
+      excerpt: r.content.slice(0, retrievalConfig.excerptLength) + '...',
     })),
   }
 }
@@ -264,7 +235,7 @@ export async function ragQueryStream(question: string, history: Message[] = [], 
       source: r.metadata.source,
       url: r.metadata.url,
       score: r.rerankScore,
-      excerpt: r.content.slice(0, 200) + '...',
+      excerpt: r.content.slice(0, retrievalConfig.excerptLength) + '...',
     })),
   }
 }

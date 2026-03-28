@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useRef, useEffect, useCallback } from 'react'
+import { conversation as conversationConfig } from '@/lib/config'
 
 interface Source {
   title: string
@@ -16,18 +17,8 @@ interface Message {
   sources?: Source[]
 }
 
-/**
- * How many recent turns to send verbatim with each request.
- * Older turns are compressed into the rolling summary instead.
- */
-const RECENT_WINDOW = 3 // turns (each turn = 1 user + 1 assistant message)
-
-/**
- * Start summarizing once the conversation exceeds this many turns.
- * Below the threshold we send full history; above it we send
- * summary + recent window.
- */
-const SUMMARY_THRESHOLD = 6 // turns
+const RECENT_WINDOW = conversationConfig.recentWindow
+const SUMMARY_THRESHOLD = conversationConfig.summaryThreshold
 
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([])

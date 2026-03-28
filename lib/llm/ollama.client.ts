@@ -1,12 +1,10 @@
 import { Ollama } from 'ollama'
 import type { ILLMClient, IEmbeddingClient, Message } from './types'
+import { ollama, llm } from '../config'
 
-// Reads from env — set OLLAMA_BASE_URL and LLM_MODEL / EMBEDDING_MODEL in .env
-const baseURL = process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434'
-const llmModel = process.env.LLM_MODEL ?? 'llama3.2'
-const embeddingModel = process.env.EMBEDDING_MODEL ?? 'nomic-embed-text'
-
-const client = new Ollama({ host: baseURL })
+const client = new Ollama({ host: ollama.baseURL })
+const llmModel = llm.model
+const embeddingModel = llm.embeddingModel
 
 export class OllamaLLMClient implements ILLMClient {
   async chat(messages: Message[]): Promise<string> {

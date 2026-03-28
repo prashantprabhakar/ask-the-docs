@@ -1,4 +1,5 @@
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters'
+import { chunking } from '../config'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -18,18 +19,8 @@ export interface Chunk {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-/**
- * Maximum characters per chunk after structural splitting.
- *
- * PROD NOTE — The right value depends on your embedding model's token limit
- *   and your retrieval quality goals:
- *   - Smaller chunks (500–800 chars) → more precise retrieval, less context per chunk
- *   - Larger chunks (1500–2000 chars) → more context but noisier matches
- *   - Rule of thumb: keep chunks under ~400 tokens (≈1600 chars at 4 chars/token)
- *   - Benchmark on your actual queries before locking this in
- */
-const MAX_CHUNK_SIZE = 1500
-const CHUNK_OVERLAP = 150
+const MAX_CHUNK_SIZE = chunking.maxChunkSize
+const CHUNK_OVERLAP = chunking.chunkOverlap
 
 /**
  * Only used to sub-split sections that exceed MAX_CHUNK_SIZE.

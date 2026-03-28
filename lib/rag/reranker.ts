@@ -33,10 +33,12 @@
  *   sentence-transformers) and call it over HTTP to avoid blocking Node.js.
  */
 
+import { reranker as rerankerConfig } from '../config'
+
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { pipeline } = require('@xenova/transformers')
 
-const MODEL = 'Xenova/ms-marco-MiniLM-L-6-v2'
+const MODEL = rerankerConfig.model
 
 /**
  * Eager warm-up — start loading the model at module import time.

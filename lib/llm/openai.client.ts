@@ -1,29 +1,23 @@
 import OpenAI from 'openai'
 import type { ILLMClient, IEmbeddingClient, Message } from './types'
+import { openai as openaiConfig, llm } from '../config'
 
 // GitHub Models is OpenAI-compatible — same SDK, just different baseURL + token.
 // Set OPENAI_PROVIDER=github in .env to use GitHub Models instead of OpenAI.
 function buildClient() {
-  const provider = process.env.OPENAI_PROVIDER ?? 'openai'
-
-  if (provider === 'github') {
-    return new OpenAI({
-      baseURL: 'https://models.inference.ai.azure.com',
-      apiKey: process.env.GITHUB_TOKEN ?? '',
-    })
+  if (openaiConfig.provider === 'github') {
+    return new OpenAI({ baseURL: openaiConfig.githubBaseURL, apiKey: openaiConfig.githubToken })
   }
-
-  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY ?? '' })
+  return new OpenAI({ apiKey: openaiConfig.apiKey })
 }
 
 function getModel() {
-  const provider = process.env.OPENAI_PROVIDER ?? 'openai'
-  if (provider === 'github') return process.env.GITHUB_MODEL ?? 'gpt-4o-mini'
-  return process.env.LLM_MODEL ?? 'gpt-4o-mini'
+  if (openaiConfig.provider === 'github') return openaiConfig.githubModel
+  return llm.model
 }
 
 function getEmbeddingModel() {
-  return process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small'
+  return llm.embeddingModel
 }
 
 export class OpenAILLMClient implements ILLMClient {

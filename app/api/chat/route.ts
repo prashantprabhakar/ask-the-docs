@@ -2,6 +2,7 @@ import 'dotenv/config'
 import { NextRequest } from 'next/server'
 import { LRUCache } from 'lru-cache'
 import { ragQueryStream } from '@/lib/rag/retriever'
+import { rateLimit as rateLimitConfig } from '@/lib/config'
 
 // ─── Rate limiter ─────────────────────────────────────────────────────────────
 
@@ -20,11 +21,11 @@ import { ragQueryStream } from '@/lib/rag/retriever'
  *   production use Redis + a Lua script (atomic increment + expire) or
  *   an edge middleware (Vercel Rate Limiting, Cloudflare Workers).
  */
-const WINDOW_MS = 60_000
-const LIMIT = 100
+const WINDOW_MS = rateLimitConfig.windowMs
+const LIMIT = rateLimitConfig.maxRequests
 
 const ipWindows = new LRUCache<string, number[]>({
-  max: 5_000,
+  max: rateLimitConfig.maxTrackedIPs,
   ttl: WINDOW_MS,
 })
 

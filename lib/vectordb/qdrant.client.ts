@@ -21,17 +21,18 @@ import { v5 as uuidv5 } from 'uuid'
 import pRetry, { AbortError } from 'p-retry'
 import { logger } from '../logger'
 import type { SparseVector } from '../rag/sparse-encoder'
+import { qdrant as qdrantConfig, llm, retry as retryConfig, retrieval as retrievalConfig } from '../config'
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const COLLECTION = 'ask-the-docs'
+const COLLECTION = qdrantConfig.collection
 
 /**
  * Named vector keys — Qdrant stores multiple vectors per point under names.
  * Query and upsert reference these names to address the right vector space.
  */
-const DENSE_VECTOR = 'dense'
-const SPARSE_VECTOR = 'sparse'
+const DENSE_VECTOR = qdrantConfig.denseVector
+const SPARSE_VECTOR = qdrantConfig.sparseVector
 
 /**
  * Must match the output dimension of your embedding model.
@@ -45,7 +46,7 @@ const SPARSE_VECTOR = 'sparse'
  *   1536 dims outperforms ada-002 on most retrieval benchmarks. For cost/quality
  *   tradeoff, matryoshka truncation to 512 dims is a common production choice.
  */
-const VECTOR_SIZE = parseInt(process.env.EMBEDDING_DIM ?? '768')
+const VECTOR_SIZE = llm.embeddingDim
 
 /**
  * Fixed namespace UUID for this application.
@@ -55,10 +56,10 @@ const VECTOR_SIZE = parseInt(process.env.EMBEDDING_DIM ?? '768')
  *   it — doing so invalidates every ID in the store and forces a full re-ingest.
  *   One namespace per logical dataset is a clean convention.
  */
-const CHUNK_NAMESPACE = 'b3d2e1f0-4a5b-6c7d-8e9f-0a1b2c3d4e5f'
+const CHUNK_NAMESPACE = qdrantConfig.chunkNamespace
 
 const client = new QdrantClient({
-  url: process.env.QDRANT_URL ?? 'http://localhost:6333',
+  url: qdrantConfig.url,
   /**
    * PROD NOTE — Also set:
    *   apiKey: process.env.QDRANT_API_KEY   (required for Qdrant Cloud)
@@ -245,8 +246,8 @@ async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
       }
     },
     {
-      retries: 3,
-      minTimeout: 500,
+      retries: retryConfig.attempts,
+      minTimeout: retryConfig.minTimeoutMs,
       randomize: true,
       onFailedAttempt: (err) => {
         logger.warn({
@@ -331,7 +332,7 @@ export async function similaritySearch(
 ): Promise<{ content: string; metadata: DocChunk['metadata']; score: number }[]> {
   await ensureCollection()
 
-  const PREFETCH_LIMIT = 20
+  const PREFETCH_LIMIT = retrievalConfig.prefetchLimit
 
   /**
    * Convert the caller-facing ChunkFilter into Qdrant's payload filter format.

@@ -60,23 +60,12 @@ import type { DocChunk } from '../vectordb'
  */
 const embedder = createEmbeddingClient()
 
+import { ingestion as ingestionConfig } from '../config'
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-/**
- * PROD NOTE — Tune this per embedding provider:
- *   Ollama local:   10–20   (CPU/GPU bound)
- *   OpenAI API:     100–500 (large batches are efficient, watch rate limits)
- *   In production you'd also run batches concurrently with a semaphore
- *   (p-limit) rather than sequentially.
- */
-const BATCH_SIZE = 10
-
-/**
- * Max concurrent LLM calls for context prefix generation within a single file.
- * Ollama (local): keep low — model server is CPU/GPU bound, higher values thrash it.
- * OpenAI/GitHub API: bump to 20 via CONTEXT_CONCURRENCY env var.
- */
-const CONTEXT_CONCURRENCY = Number(process.env.CONTEXT_CONCURRENCY ?? 3)
+const BATCH_SIZE = ingestionConfig.batchSize
+const CONTEXT_CONCURRENCY = ingestionConfig.contextConcurrency
 
 // ─── File Walking ─────────────────────────────────────────────────────────────
 
