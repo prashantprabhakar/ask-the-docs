@@ -66,6 +66,8 @@ export const ingestion = {
   batchSize: 10,
   /** Max concurrent LLM calls for context prefix generation per file. */
   contextConcurrency: Number(process.env.CONTEXT_CONCURRENCY ?? 3),
+  /** Max files processed in parallel. Ollama: 2–3 (GPU-bound). OpenAI API: 5–10. */
+  fileConcurrency: Number(process.env.FILE_CONCURRENCY ?? 3),
 }
 
 // ─── Rate limiting ────────────────────────────────────────────────────────────

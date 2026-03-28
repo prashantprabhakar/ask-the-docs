@@ -66,6 +66,7 @@ import { ingestion as ingestionConfig } from '../config'
 
 const BATCH_SIZE = ingestionConfig.batchSize
 const CONTEXT_CONCURRENCY = ingestionConfig.contextConcurrency
+const FILE_CONCURRENCY = ingestionConfig.fileConcurrency
 
 // ─── File Walking ─────────────────────────────────────────────────────────────
 
@@ -151,6 +152,7 @@ interface EmbedResult {
   chunks: number
   contextMs: number
   embedUpsertMs: number
+  logLines: string[]
 }
 
 function fmtMs(ms: number): string {
@@ -162,8 +164,9 @@ function fmtMs(ms: number): string {
 }
 
 async function embedAndStore(doc: RawDocument, filePath: string): Promise<EmbedResult> {
+  const logLines: string[] = []
   const chunks = await chunkDocument(doc)
-  if (chunks.length === 0) return { chunks: 0, contextMs: 0, embedUpsertMs: 0 }
+  if (chunks.length === 0) return { chunks: 0, contextMs: 0, embedUpsertMs: 0, logLines }
 
   /**
    * Contextual retrieval — prepend an LLM-generated context sentence to each
@@ -202,10 +205,10 @@ async function embedAndStore(doc: RawDocument, filePath: string): Promise<EmbedR
 
         const label = chunk.sectionTitle.slice(0, 45).padEnd(45)
         const slowFlag = chunkMs > 30_000 ? '  ← SLOW' : ''
-        ilog.write(`    ctx ${String(completed).padStart(2)}/${chunks.length}  ${label}  ${fmtMs(chunkMs)}${slowFlag}\n`)
+        logLines.push(`    ctx ${String(completed).padStart(2)}/${chunks.length}  ${label}  ${fmtMs(chunkMs)}${slowFlag}\n`)
 
         if (chunkMs > 30_000) {
-          ilog.warn(`chunk ${i + 1} took ${fmtMs(chunkMs)} — section: "${chunk.sectionTitle}"`)
+          logLines.push(`  ⚠  chunk ${i + 1} took ${fmtMs(chunkMs)} — section: "${chunk.sectionTitle}"\n`)
         }
 
         return context ? `${context}\n\n${chunk.content}` : chunk.content
@@ -249,7 +252,7 @@ async function embedAndStore(doc: RawDocument, filePath: string): Promise<EmbedR
   }
   const embedUpsertMs = Date.now() - t1
 
-  return { chunks: chunks.length, contextMs, embedUpsertMs }
+  return { chunks: chunks.length, contextMs, embedUpsertMs, logLines }
 }
 
 // ─── Ingestion Pipeline ───────────────────────────────────────────────────────
@@ -281,10 +284,10 @@ export interface IngestOptions {
  * This means you can run this on a cron job (or on every git pull of the docs)
  * and it will stay in sync cheaply.
  *
- * PROD NOTE — This is a sequential, single-process pipeline. For large doc sets
- *   (10k+ files), split the file list across workers and coordinate via a job
- *   queue (BullMQ, Temporal). Each worker claims a file, processes it, and marks
- *   it done. The cache then lives in a shared DB, not a local JSON file.
+ * PROD NOTE — For large doc sets (10k+ files), split the file list across
+ *   workers and coordinate via a job queue (BullMQ, Temporal). Each worker
+ *   claims a file, processes it, and marks it done. The cache then lives in
+ *   a shared DB, not a local JSON file.
  */
 export async function ingestDocuments(dir: string, options: IngestOptions = {}) {
   const ingestStart = Date.now()
@@ -309,10 +312,11 @@ export async function ingestDocuments(dir: string, options: IngestOptions = {}) 
     }
   }
 
-  // ── Step 2: Process each file ──────────────────────────────────────────────
-  let processed = 0
+  // ── Step 2: Partition files into skipped vs. to-process ───────────────────
   let skipped = 0
   let totalChunks = 0
+
+  const filesToProcess: { filePath: string; source: string }[] = []
 
   for (const filePath of allFiles) {
     const source = toSource(filePath, dir)
@@ -323,41 +327,59 @@ export async function ingestDocuments(dir: string, options: IngestOptions = {}) 
     newCache[source] = hash
 
     if (!options.full && cache[source] === hash) {
-      // Content unchanged — no work to do for this file
       skipped++
-      continue
+    } else {
+      filesToProcess.push({ filePath, source })
     }
-
-    /**
-     * File is new or changed.
-     *
-     * Delete first, then upsert. This is the critical two-step that prevents
-     * orphan chunks when a file shrinks (fewer sections after editing) or
-     * when section boundaries shift (changing chunk content → new UUID,
-     * old UUID becomes an orphan).
-     *
-     * PROD NOTE — delete + upsert is not atomic. If the process crashes between
-     *   the two, the file will have no chunks in Qdrant until the next run
-     *   (which will re-ingest it since the cache won't have been saved yet).
-     *   For truly atomic updates, use Qdrant's collection aliases: write to a
-     *   shadow collection, then swap the alias. Overkill for this project.
-     */
-    processed++
-    ilog.write(`\n  [${processed}/${allFiles.length}] ${source}\n`)
-
-    await deleteChunksBySource(source)
-
-    const doc = loadRawDocument(filePath, source)
-    const { chunks, contextMs, embedUpsertMs } = await embedAndStore(doc, filePath)
-
-    totalChunks += chunks
-    ilog.write(`       context: ${fmtMs(contextMs)} | embed+upsert: ${fmtMs(embedUpsertMs)} | ${chunks} chunks\n`)
   }
 
-  // ── Step 3: Save updated cache ─────────────────────────────────────────────
+  ilog.write(`${filesToProcess.length} file(s) to process, ${skipped} unchanged\n`)
+
+  // ── Step 3: Process files in parallel (FILE_CONCURRENCY at a time) ────────
+  //
+  // Each file task: delete stale chunks → embed → upsert.
+  // Log lines are buffered inside embedAndStore and flushed atomically here
+  // so output from concurrent files doesn't interleave.
+  //
+  // Counter mutations (totalChunks, processed) are safe — JS is single-threaded;
+  // even though tasks overlap in wall time, mutations happen between await points.
+  //
+  // Delete first, then upsert. This is the critical two-step that prevents
+  // orphan chunks when a file shrinks (fewer sections after editing) or when
+  // section boundaries shift (changing chunk content → new UUID, old UUID orphan).
+  //
+  // PROD NOTE — delete + upsert is not atomic. If the process crashes between
+  //   the two, the file will have no chunks until the next run (which will
+  //   re-ingest it since the cache won't have been saved). For truly atomic
+  //   updates, use Qdrant's collection aliases: write to a shadow collection,
+  //   then swap. Overkill for this project.
+  let processed = 0
+  const fileLimit = pLimit(FILE_CONCURRENCY)
+
+  await Promise.all(
+    filesToProcess.map(({ filePath, source }, idx) =>
+      fileLimit(async () => {
+        await deleteChunksBySource(source)
+
+        const doc = loadRawDocument(filePath, source)
+        const { chunks, contextMs, embedUpsertMs, logLines } = await embedAndStore(doc, filePath)
+
+        // Mutations are safe — JS event loop serialises these between awaits
+        processed++
+        totalChunks += chunks
+
+        // Flush all log lines for this file as one atomic write to avoid interleaving
+        ilog.write(`\n  [${idx + 1}/${filesToProcess.length}] ${source}\n`)
+        ilog.write(logLines.join(''))
+        ilog.write(`       context: ${fmtMs(contextMs)} | embed+upsert: ${fmtMs(embedUpsertMs)} | ${chunks} chunks\n`)
+      })
+    )
+  )
+
+  // ── Step 4: Save updated cache ─────────────────────────────────────────────
   saveCache(newCache)
 
-  // ── Step 4: Rebuild IDF table from full corpus ─────────────────────────────
+  // ── Step 5: Rebuild IDF table from full corpus ─────────────────────────────
   // Scroll all chunk texts from Qdrant (including chunks from unchanged files)
   // so the IDF table reflects the complete corpus, not just what changed.
   //
