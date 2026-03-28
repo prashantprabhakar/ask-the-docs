@@ -394,8 +394,22 @@ export async function similaritySearch(
 }
 
 /**
+ * Delete a specific set of chunks by their point IDs.
+ * Used by the section-level cache to remove only the chunks belonging to
+ * sections that changed or were removed — not the entire file.
+ */
+export async function deleteChunksByIds(ids: string[]): Promise<void> {
+  if (ids.length === 0) return
+  await ensureCollection()
+  await withRetry(() =>
+    client.delete(COLLECTION, { wait: true, points: ids })
+  )
+}
+
+/**
  * Delete all chunks belonging to a specific source file.
  * The payload index on metadata.source makes this a fast indexed lookup.
+ * Reserved for full re-ingests — use deleteChunksByIds for incremental updates.
  */
 export async function deleteChunksBySource(source: string): Promise<void> {
   await ensureCollection()

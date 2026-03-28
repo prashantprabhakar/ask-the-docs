@@ -58,7 +58,7 @@ function stripFrontMatter(content: string): string {
 
 // ─── Structural Header Splitting ──────────────────────────────────────────────
 
-interface Section {
+export interface Section {
   headingPath: string  // e.g. "App Router > Layouts > Nested Layouts"
   content: string
 }
@@ -76,7 +76,7 @@ interface Section {
  * MDX-aware: front-matter is stripped before splitting, and headings inside
  * code fences are not treated as section boundaries.
  */
-function splitIntoSections(doc: RawDocument): Section[] {
+export function splitIntoSections(doc: RawDocument): Section[] {
   const content = stripFrontMatter(doc.content)
   const lines = content.split('\n')
 
@@ -228,45 +228,46 @@ function withSectionPrefix(sectionTitle: string, content: string): string {
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
+/**
+ * Chunk a single section into one or more Chunk objects.
+ * Exported so the ingester can process sections individually for section-level caching.
+ *
+ * If the section fits within MAX_CHUNK_SIZE it becomes one chunk (chunkIndex = 0).
+ * Otherwise it is sub-split while preserving tables intact.
+ *
+ * PROD NOTE — Sub-split fragments lose full-section context. If precision
+ *   matters more than coverage, consider increasing MAX_CHUNK_SIZE to avoid
+ *   sub-splitting, or use a sliding window approach instead.
+ */
+export async function chunkSection(doc: RawDocument, section: Section): Promise<Chunk[]> {
+  if (section.content.length <= MAX_CHUNK_SIZE) {
+    return [{
+      content: withSectionPrefix(section.headingPath, section.content),
+      source: doc.source,
+      title: doc.title,
+      sectionTitle: section.headingPath,
+      chunkIndex: 0,
+    }]
+  }
+
+  // We sub-split the raw content (without prefix), then add the prefix to each
+  // sub-chunk. This avoids the prefix inflating the size check.
+  const subTexts = await splitPreservingTables(section.content)
+  return subTexts.map((text, i) => ({
+    content: withSectionPrefix(section.headingPath, text),
+    source: doc.source,
+    title: doc.title,
+    sectionTitle: section.headingPath,
+    chunkIndex: i,
+  }))
+}
+
 export async function chunkDocument(doc: RawDocument): Promise<Chunk[]> {
   const sections = splitIntoSections(doc)
   const chunks: Chunk[] = []
-
   for (const section of sections) {
-    if (section.content.length <= MAX_CHUNK_SIZE) {
-      // Section fits in one chunk — no sub-splitting needed.
-      // chunkIndex = 0 signals "this is the whole section, not a fragment".
-      chunks.push({
-        content: withSectionPrefix(section.headingPath, section.content),
-        source: doc.source,
-        title: doc.title,
-        sectionTitle: section.headingPath,
-        chunkIndex: 0,
-      })
-    } else {
-      /**
-       * Section is too large — sub-split it while preserving tables intact.
-       *
-       * We sub-split the raw content (without prefix), then add the prefix
-       * to each sub-chunk. This avoids the prefix inflating the size check.
-       *
-       * PROD NOTE — Sub-split fragments lose full-section context. If precision
-       *   matters more than coverage, consider increasing MAX_CHUNK_SIZE to
-       *   avoid sub-splitting, or use a sliding window approach instead.
-       */
-      const subTexts = await splitPreservingTables(section.content)
-      subTexts.forEach((text, i) => {
-        chunks.push({
-          content: withSectionPrefix(section.headingPath, text),
-          source: doc.source,
-          title: doc.title,
-          sectionTitle: section.headingPath,
-          chunkIndex: i,
-        })
-      })
-    }
+    chunks.push(...await chunkSection(doc, section))
   }
-
   return chunks
 }
 

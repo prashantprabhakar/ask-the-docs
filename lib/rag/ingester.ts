@@ -43,12 +43,12 @@ class IngestLog {
 const ilog = new IngestLog()
 import type { DocType } from '../vectordb'
 import { createEmbeddingClient } from '../llm/factory'
-import { chunkDocument } from './chunker'
-import { upsertChunks, chunkId, deleteChunksBySource, scrollAllChunkTexts } from '../vectordb'
+import { upsertChunks, chunkId, deleteChunksByIds, deleteChunksBySource, scrollAllChunkTexts } from '../vectordb'
 import { encodeSparse, tokenize, reloadIdfTable } from './sparse-encoder'
 import { buildIdfTable, saveIdfTable } from './idf-table'
-import { loadCache, saveCache, hashFileContent } from './ingest-cache'
+import { loadCache, saveCache, hashContent, type FileCache, type SectionCache } from './ingest-cache'
 import { generateContextPrefix } from './context-builder'
+import { splitIntoSections, chunkSection } from './chunker'
 import type { RawDocument } from './chunker'
 import type { DocChunk } from '../vectordb'
 
@@ -153,6 +153,7 @@ interface EmbedResult {
   contextMs: number
   embedUpsertMs: number
   logLines: string[]
+  newSectionCache: SectionCache
 }
 
 function fmtMs(ms: number): string {
@@ -163,40 +164,94 @@ function fmtMs(ms: number): string {
   return `${mins}m ${secs}s`
 }
 
-async function embedAndStore(doc: RawDocument, filePath: string): Promise<EmbedResult> {
+/**
+ * Embed and store a document using section-level diffing.
+ *
+ * Only sections whose content has changed since the last run are re-embedded.
+ * Unchanged sections are skipped entirely — no LLM call, no embedding API call,
+ * no Qdrant write. Changed or new sections replace their old chunk IDs precisely.
+ *
+ * Algorithm:
+ *   1. Split doc into sections (cheap — string ops only)
+ *   2. Hash each section's raw content and compare against cachedSections
+ *   3. Unchanged → carry cached entry forward, skip
+ *      Changed/new → mark for embedding; schedule old IDs for deletion
+ *      Removed (in cache but gone from file) → schedule old IDs for deletion
+ *   4. Delete stale IDs in one batch
+ *   5. Embed + upsert only the changed/new sections
+ *   6. Record new chunk IDs in the returned section cache
+ */
+async function embedAndStore(
+  doc: RawDocument,
+  filePath: string,
+  cachedSections: SectionCache,
+): Promise<EmbedResult> {
   const logLines: string[] = []
-  const chunks = await chunkDocument(doc)
-  if (chunks.length === 0) return { chunks: 0, contextMs: 0, embedUpsertMs: 0, logLines }
+  const newSectionCache: SectionCache = {}
 
-  /**
-   * Contextual retrieval — prepend an LLM-generated context sentence to each
-   * chunk before embedding. This makes ambiguous chunks retrievable.
-   *
-   * Example — without context the embedding of:
-   *   "App Router > Image > Lazy Loading\n\nThe default value is `true`."
-   * won't match "is lazy loading enabled by default?" well.
-   *
-   * With context:
-   *   "This chunk describes the default lazy loading setting for next/image.\n\n
-   *    App Router > Image > Lazy Loading\n\nThe default value is `true`."
-   * the embedding is anchored to the right concept.
-   *
-   * Context is generated concurrently (CONTEXT_CONCURRENCY calls at a time).
-   * Ingest is already a background script so latency here doesn't affect query time.
-   * Incremental ingest means this runs only for new or changed chunks.
-   *
-   * PROD NOTE — Tune CONTEXT_CONCURRENCY per provider:
-   *   Ollama local: 3 (CPU/GPU bound — higher values thrash the model server)
-   *   OpenAI/GitHub API: 20 (network-bound, watch rate limits)
-   */
+  const sections = splitIntoSections(doc)
+  if (sections.length === 0) {
+    return { chunks: 0, contextMs: 0, embedUpsertMs: 0, logLines, newSectionCache }
+  }
+
+  // ── Diff sections against cache ───────────────────────────────────────────
+  const toEmbed: Array<{ section: typeof sections[0]; hash: string }> = []
+  const staleIds: string[] = []
+  let skippedSections = 0
+
+  for (const section of sections) {
+    const hash = hashContent(section.content)
+    const cached = cachedSections[section.headingPath]
+
+    if (cached && cached.hash === hash) {
+      newSectionCache[section.headingPath] = cached  // carry forward unchanged
+      skippedSections++
+    } else {
+      if (cached) staleIds.push(...cached.chunkIds)  // old IDs for this section
+      toEmbed.push({ section, hash })
+    }
+  }
+
+  // Sections that existed in cache but are gone from the file → delete their IDs
+  const currentHeadings = new Set(sections.map((s) => s.headingPath))
+  for (const [title, entry] of Object.entries(cachedSections)) {
+    if (!currentHeadings.has(title)) staleIds.push(...entry.chunkIds)
+  }
+
+  if (staleIds.length > 0) await deleteChunksByIds(staleIds)
+
+  if (skippedSections > 0) {
+    logLines.push(`    ${skippedSections} section(s) unchanged, skipped\n`)
+  }
+
+  if (toEmbed.length === 0) {
+    return { chunks: 0, contextMs: 0, embedUpsertMs: 0, logLines, newSectionCache }
+  }
+
+  // ── Flatten sections → chunks ─────────────────────────────────────────────
+  const allChunks: Awaited<ReturnType<typeof chunkSection>> = []
+  for (const { section } of toEmbed) {
+    allChunks.push(...await chunkSection(doc, section))
+  }
+
+  if (allChunks.length === 0) {
+    return { chunks: 0, contextMs: 0, embedUpsertMs: 0, logLines, newSectionCache }
+  }
+
+  // ── Generate contextual prefixes (concurrent) ─────────────────────────────
+  //
+  // Context is only generated for chunks that are actually being re-embedded,
+  // so the per-run cost scales with changed sections, not total file size.
+  //
+  // PROD NOTE — Tune CONTEXT_CONCURRENCY per provider:
+  //   Ollama local: 3 (CPU/GPU bound — higher values thrash the model server)
+  //   OpenAI/GitHub API: 20 (network-bound, watch rate limits)
   const contextLimit = pLimit(CONTEXT_CONCURRENCY)
   const t0 = Date.now()
-
-  // Per-chunk counter for progress display (atomic via closure — chunks complete out of order)
   let completed = 0
 
   const contextualContents = await Promise.all(
-    chunks.map((chunk, i) =>
+    allChunks.map((chunk, i) =>
       contextLimit(async () => {
         const chunkT = Date.now()
         const context = await generateContextPrefix(doc.title, chunk.sectionTitle, chunk.content)
@@ -205,7 +260,7 @@ async function embedAndStore(doc: RawDocument, filePath: string): Promise<EmbedR
 
         const label = chunk.sectionTitle.slice(0, 45).padEnd(45)
         const slowFlag = chunkMs > 30_000 ? '  ← SLOW' : ''
-        logLines.push(`    ctx ${String(completed).padStart(2)}/${chunks.length}  ${label}  ${fmtMs(chunkMs)}${slowFlag}\n`)
+        logLines.push(`    ctx ${String(completed).padStart(2)}/${allChunks.length}  ${label}  ${fmtMs(chunkMs)}${slowFlag}\n`)
 
         if (chunkMs > 30_000) {
           logLines.push(`  ⚠  chunk ${i + 1} took ${fmtMs(chunkMs)} — section: "${chunk.sectionTitle}"\n`)
@@ -217,42 +272,58 @@ async function embedAndStore(doc: RawDocument, filePath: string): Promise<EmbedR
   )
   const contextMs = Date.now() - t0
 
+  // ── Embed + upsert in batches, tracking IDs per section ───────────────────
+  //
+  // We record which chunk IDs belong to each section so the next run can
+  // delete exactly those IDs if the section changes again.
+  //
+  // Chunk IDs are content-addressed (UUID v5 of source + contextual content):
+  //   same content → same ID → upsert is idempotent
+  //   changed content → new ID → old ID was already deleted above
   const t1 = Date.now()
-  for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-    const batch = chunks.slice(i, i + BATCH_SIZE)
+  const sectionIdMap = new Map<string, string[]>()
+
+  for (let i = 0; i < allChunks.length; i += BATCH_SIZE) {
+    const batch = allChunks.slice(i, i + BATCH_SIZE)
     const batchContents = contextualContents.slice(i, i + BATCH_SIZE)
     const embeddings = await embedder.embedBatch(batchContents)
 
-    const docChunks: DocChunk[] = batch.map((chunk, j) => ({
-      /**
-       * Content-addressed UUID v5.
-       * Same content = same ID → upsert is idempotent.
-       * Changed content = new ID → old chunk was already deleted by deleteChunksBySource.
-       *
-       * NOTE — We hash the contextual content (with prefix), not the raw chunk.
-       * If the context generation output changes (e.g. prompt update), the hash
-       * changes and the chunk is re-embedded on the next full ingest.
-       */
-      id: chunkId(chunk.source, batchContents[j]),
-      content: batchContents[j],
-      embedding: embeddings[j],
-      sparseVector: encodeSparse(batchContents[j]),
-      metadata: {
-        source: chunk.source,
-        title: chunk.title,
-        sectionTitle: chunk.sectionTitle,
-        chunkIndex: chunk.chunkIndex,
-        lastModified: fs.statSync(filePath).mtime.toISOString(),
-        docType: inferDocType(chunk.source),
-        url: buildDocsUrl(chunk.source),
-      },
-    }))
+    const docChunks: DocChunk[] = batch.map((chunk, j) => {
+      const id = chunkId(chunk.source, batchContents[j])
+      const ids = sectionIdMap.get(chunk.sectionTitle) ?? []
+      ids.push(id)
+      sectionIdMap.set(chunk.sectionTitle, ids)
+
+      return {
+        id,
+        content: batchContents[j],
+        embedding: embeddings[j],
+        sparseVector: encodeSparse(batchContents[j]),
+        metadata: {
+          source: chunk.source,
+          title: chunk.title,
+          sectionTitle: chunk.sectionTitle,
+          chunkIndex: chunk.chunkIndex,
+          lastModified: fs.statSync(filePath).mtime.toISOString(),
+          docType: inferDocType(chunk.source),
+          url: buildDocsUrl(chunk.source),
+        },
+      }
+    })
 
     await upsertChunks(docChunks)
   }
   const embedUpsertMs = Date.now() - t1
 
-  return { chunks: chunks.length, contextMs, embedUpsertMs, logLines }
+  // Record the new section cache entries for everything we just embedded
+  for (const { section, hash } of toEmbed) {
+    newSectionCache[section.headingPath] = {
+      hash,
+      chunkIds: sectionIdMap.get(section.headingPath) ?? [],
+    }
+  }
+
+  return { chunks: allChunks.length, contextMs, embedUpsertMs, logLines, newSectionCache }
 }
 
 // ─── Ingestion Pipeline ───────────────────────────────────────────────────────
@@ -295,91 +366,75 @@ export async function ingestDocuments(dir: string, options: IngestOptions = {}) 
   ilog.write(`\n=== Starting ${options.full ? 'full' : 'incremental'} ingestion ===\n\n`)
 
   const allFiles = walkFiles(dir)
-  const cache = options.full ? {} : loadCache()
-  const newCache: Record<string, string> = {}
+  const cache: FileCache = options.full ? {} : loadCache()
+  const newCache: FileCache = {}
 
   // ── Step 1: Detect deleted files ──────────────────────────────────────────
   // Any source in the cache that no longer exists on disk is a deleted file.
-  // Remove its chunks from Qdrant.
+  // Delete only the exact chunk IDs we tracked — no payload-filter scan needed.
   const diskSources = new Set(allFiles.map((f) => toSource(f, dir)))
   const deletedSources = Object.keys(cache).filter((s) => !diskSources.has(s))
 
   if (deletedSources.length > 0) {
     ilog.write(`Removing ${deletedSources.length} deleted file(s) from vector store...\n`)
     for (const source of deletedSources) {
-      await deleteChunksBySource(source)
+      const allIds = Object.values(cache[source]).flatMap((e) => e.chunkIds)
+      await deleteChunksByIds(allIds)
       ilog.write(`  Removed: ${source}\n`)
     }
   }
 
-  // ── Step 2: Partition files into skipped vs. to-process ───────────────────
+  // ── Step 2: Process all files in parallel (FILE_CONCURRENCY at a time) ────
+  //
+  // Section-level diffing inside embedAndStore means we only embed sections
+  // that actually changed. "Processed" = at least one section changed.
+  // "Skipped" = every section was identical to the cached version.
+  //
+  // Log lines are buffered inside embedAndStore and flushed atomically so
+  // output from concurrent files doesn't interleave in the log.
+  //
+  // For --full ingest: deleteChunksBySource first (nuclear wipe), then embed
+  // everything fresh. This guarantees no stale vectors survive a model change.
+  let processed = 0
   let skipped = 0
   let totalChunks = 0
-
-  const filesToProcess: { filePath: string; source: string }[] = []
-
-  for (const filePath of allFiles) {
-    const source = toSource(filePath, dir)
-    const content = fs.readFileSync(filePath, 'utf-8')
-    const hash = hashFileContent(content)
-
-    // Always carry the current hash forward into the new cache
-    newCache[source] = hash
-
-    if (!options.full && cache[source] === hash) {
-      skipped++
-    } else {
-      filesToProcess.push({ filePath, source })
-    }
-  }
-
-  ilog.write(`${filesToProcess.length} file(s) to process, ${skipped} unchanged\n`)
-
-  // ── Step 3: Process files in parallel (FILE_CONCURRENCY at a time) ────────
-  //
-  // Each file task: delete stale chunks → embed → upsert.
-  // Log lines are buffered inside embedAndStore and flushed atomically here
-  // so output from concurrent files doesn't interleave.
-  //
-  // Counter mutations (totalChunks, processed) are safe — JS is single-threaded;
-  // even though tasks overlap in wall time, mutations happen between await points.
-  //
-  // Delete first, then upsert. This is the critical two-step that prevents
-  // orphan chunks when a file shrinks (fewer sections after editing) or when
-  // section boundaries shift (changing chunk content → new UUID, old UUID orphan).
-  //
-  // PROD NOTE — delete + upsert is not atomic. If the process crashes between
-  //   the two, the file will have no chunks until the next run (which will
-  //   re-ingest it since the cache won't have been saved). For truly atomic
-  //   updates, use Qdrant's collection aliases: write to a shadow collection,
-  //   then swap. Overkill for this project.
-  let processed = 0
   const fileLimit = pLimit(FILE_CONCURRENCY)
 
   await Promise.all(
-    filesToProcess.map(({ filePath, source }, idx) =>
+    allFiles.map((filePath, idx) =>
       fileLimit(async () => {
-        await deleteChunksBySource(source)
-
+        const source = toSource(filePath, dir)
         const doc = loadRawDocument(filePath, source)
-        const { chunks, contextMs, embedUpsertMs, logLines } = await embedAndStore(doc, filePath)
 
-        // Mutations are safe — JS event loop serialises these between awaits
-        processed++
-        totalChunks += chunks
+        if (options.full) {
+          // Wipe all existing vectors for this source before re-embedding
+          await deleteChunksBySource(source)
+        }
 
-        // Flush all log lines for this file as one atomic write to avoid interleaving
-        ilog.write(`\n  [${idx + 1}/${filesToProcess.length}] ${source}\n`)
-        ilog.write(logLines.join(''))
-        ilog.write(`       context: ${fmtMs(contextMs)} | embed+upsert: ${fmtMs(embedUpsertMs)} | ${chunks} chunks\n`)
+        const cachedSections = options.full ? {} : (cache[source] ?? {})
+        const { chunks, contextMs, embedUpsertMs, logLines, newSectionCache } =
+          await embedAndStore(doc, filePath, cachedSections)
+
+        // Mutations safe — JS event loop serialises between awaits
+        newCache[source] = newSectionCache
+
+        if (chunks > 0) {
+          processed++
+          totalChunks += chunks
+          ilog.write(`\n  [${idx + 1}/${allFiles.length}] ${source}\n`)
+          ilog.write(logLines.join(''))
+          ilog.write(`       context: ${fmtMs(contextMs)} | embed+upsert: ${fmtMs(embedUpsertMs)} | ${chunks} chunks\n`)
+        } else {
+          skipped++
+        }
       })
     )
   )
 
-  // ── Step 4: Save updated cache ─────────────────────────────────────────────
+  // ── Step 3: Save updated cache ─────────────────────────────────────────────
   saveCache(newCache)
 
-  // ── Step 5: Rebuild IDF table from full corpus ─────────────────────────────
+  // ── Step 4: Rebuild IDF table from full corpus ─────────────────────────────
   // Scroll all chunk texts from Qdrant (including chunks from unchanged files)
   // so the IDF table reflects the complete corpus, not just what changed.
   //
