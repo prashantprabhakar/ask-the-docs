@@ -1,6 +1,46 @@
 import fs from 'fs'
 import path from 'path'
 import pLimit from 'p-limit'
+
+// ─── Ingest logger (tee: stdout + file) ──────────────────────────────────────
+
+/**
+ * Writes every ingest progress line to stdout AND a timestamped log file.
+ * This means you can watch the run live AND grep the file after to diagnose
+ * what was slow.
+ *
+ * Log path: logs/ingest-{ISO-timestamp}.log  (created automatically)
+ */
+class IngestLog {
+  private stream: fs.WriteStream | null = null
+  private logPath = ''
+
+  open(): void {
+    const ts = new Date().toISOString().replace(/:/g, '-').replace(/\..+/, '')
+    this.logPath = path.join(process.cwd(), 'logs', `ingest-${ts}.log`)
+    fs.mkdirSync(path.dirname(this.logPath), { recursive: true })
+    this.stream = fs.createWriteStream(this.logPath, { flags: 'a' })
+    this.write(`=== Ingest started ${new Date().toISOString()} ===\n`)
+    process.stdout.write(`Log file: ${this.logPath}\n`)
+  }
+
+  write(msg: string): void {
+    process.stdout.write(msg)
+    this.stream?.write(msg)
+  }
+
+  warn(msg: string): void {
+    this.write(`  ⚠  ${msg}\n`)
+  }
+
+  close(): void {
+    this.write(`=== Ingest ended ${new Date().toISOString()} ===\n`)
+    this.stream?.end()
+    this.stream = null
+  }
+}
+
+const ilog = new IngestLog()
 import type { DocType } from '../vectordb'
 import { createEmbeddingClient } from '../llm/factory'
 import { chunkDocument } from './chunker'
@@ -118,9 +158,23 @@ function loadRawDocument(filePath: string, source: string): RawDocument {
 
 // ─── Per-file Embed + Store ───────────────────────────────────────────────────
 
-async function embedAndStore(doc: RawDocument, filePath: string): Promise<number> {
+interface EmbedResult {
+  chunks: number
+  contextMs: number
+  embedUpsertMs: number
+}
+
+function fmtMs(ms: number): string {
+  if (ms < 1_000) return `${ms}ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
+  const mins = Math.floor(ms / 60_000)
+  const secs = Math.round((ms % 60_000) / 1000)
+  return `${mins}m ${secs}s`
+}
+
+async function embedAndStore(doc: RawDocument, filePath: string): Promise<EmbedResult> {
   const chunks = await chunkDocument(doc)
-  if (chunks.length === 0) return 0
+  if (chunks.length === 0) return { chunks: 0, contextMs: 0, embedUpsertMs: 0 }
 
   /**
    * Contextual retrieval — prepend an LLM-generated context sentence to each
@@ -145,10 +199,26 @@ async function embedAndStore(doc: RawDocument, filePath: string): Promise<number
    */
   const contextLimit = pLimit(CONTEXT_CONCURRENCY)
   const t0 = Date.now()
+
+  // Per-chunk counter for progress display (atomic via closure — chunks complete out of order)
+  let completed = 0
+
   const contextualContents = await Promise.all(
-    chunks.map((chunk) =>
+    chunks.map((chunk, i) =>
       contextLimit(async () => {
+        const chunkT = Date.now()
         const context = await generateContextPrefix(doc.title, chunk.sectionTitle, chunk.content)
+        const chunkMs = Date.now() - chunkT
+        completed++
+
+        const label = chunk.sectionTitle.slice(0, 45).padEnd(45)
+        const slowFlag = chunkMs > 30_000 ? '  ← SLOW' : ''
+        ilog.write(`    ctx ${String(completed).padStart(2)}/${chunks.length}  ${label}  ${fmtMs(chunkMs)}${slowFlag}\n`)
+
+        if (chunkMs > 30_000) {
+          ilog.warn(`chunk ${i + 1} took ${fmtMs(chunkMs)} — section: "${chunk.sectionTitle}"`)
+        }
+
         return context ? `${context}\n\n${chunk.content}` : chunk.content
       })
     )
@@ -190,8 +260,7 @@ async function embedAndStore(doc: RawDocument, filePath: string): Promise<number
   }
   const embedUpsertMs = Date.now() - t1
 
-  process.stdout.write(`    context: ${(contextMs / 1000).toFixed(1)}s | embed+upsert: ${(embedUpsertMs / 1000).toFixed(1)}s\n`)
-  return chunks.length
+  return { chunks: chunks.length, contextMs, embedUpsertMs }
 }
 
 // ─── Ingestion Pipeline ───────────────────────────────────────────────────────
@@ -230,7 +299,8 @@ export interface IngestOptions {
  */
 export async function ingestDocuments(dir: string, options: IngestOptions = {}) {
   const ingestStart = Date.now()
-  console.log(`\n=== Starting ${options.full ? 'full' : 'incremental'} ingestion ===\n`)
+  ilog.open()
+  ilog.write(`\n=== Starting ${options.full ? 'full' : 'incremental'} ingestion ===\n\n`)
 
   const allFiles = walkFiles(dir)
   const cache = options.full ? {} : loadCache()
@@ -243,10 +313,10 @@ export async function ingestDocuments(dir: string, options: IngestOptions = {}) 
   const deletedSources = Object.keys(cache).filter((s) => !diskSources.has(s))
 
   if (deletedSources.length > 0) {
-    console.log(`Removing ${deletedSources.length} deleted file(s) from vector store...`)
+    ilog.write(`Removing ${deletedSources.length} deleted file(s) from vector store...\n`)
     for (const source of deletedSources) {
       await deleteChunksBySource(source)
-      console.log(`  Removed: ${source}`)
+      ilog.write(`  Removed: ${source}\n`)
     }
   }
 
@@ -283,14 +353,16 @@ export async function ingestDocuments(dir: string, options: IngestOptions = {}) 
      *   For truly atomic updates, use Qdrant's collection aliases: write to a
      *   shadow collection, then swap the alias. Overkill for this project.
      */
+    processed++
+    ilog.write(`\n  [${processed}/${allFiles.length}] ${source}\n`)
+
     await deleteChunksBySource(source)
 
     const doc = loadRawDocument(filePath, source)
-    const chunks = await embedAndStore(doc, filePath)
+    const { chunks, contextMs, embedUpsertMs } = await embedAndStore(doc, filePath)
 
     totalChunks += chunks
-    processed++
-    console.log(`  [${processed}] ${source} → ${chunks} chunks`)
+    ilog.write(`       context: ${fmtMs(contextMs)} | embed+upsert: ${fmtMs(embedUpsertMs)} | ${chunks} chunks\n`)
   }
 
   // ── Step 3: Save updated cache ─────────────────────────────────────────────
@@ -306,23 +378,23 @@ export async function ingestDocuments(dir: string, options: IngestOptions = {}) 
   // PROD NOTE — For large corpora, maintain term counts incrementally
   //   (update only the chunks that changed) rather than scrolling everything.
   //   See idf-table.ts for details.
-  console.log('\nRebuilding IDF table...')
+  ilog.write('\nRebuilding IDF table...\n')
   const allTexts = await scrollAllChunkTexts()
   if (allTexts.length > 0) {
     const termSets = allTexts.map((text) => new Set(tokenize(text)))
     const idfTable = buildIdfTable(termSets)
     saveIdfTable(idfTable)
     reloadIdfTable()
-    console.log(`IDF table saved: ${Object.keys(idfTable.termDf).length} unique terms across ${idfTable.totalDocs} chunks`)
+    ilog.write(`IDF table saved: ${Object.keys(idfTable.termDf).length} unique terms across ${idfTable.totalDocs} chunks\n`)
   } else {
-    console.log('No chunks in store — IDF table not built.')
+    ilog.write('No chunks in store — IDF table not built.\n')
   }
 
-  const totalSec = ((Date.now() - ingestStart) / 1000).toFixed(1)
-  console.log('\n=== Ingestion complete ===')
-  console.log(`Files processed : ${processed}`)
-  console.log(`Files skipped   : ${skipped} (unchanged)`)
-  console.log(`Files deleted   : ${deletedSources.length}`)
-  console.log(`Chunks embedded : ${totalChunks}`)
-  console.log(`Total time      : ${totalSec}s`)
+  ilog.write('\n=== Ingestion complete ===\n')
+  ilog.write(`Files processed : ${processed}\n`)
+  ilog.write(`Files skipped   : ${skipped} (unchanged)\n`)
+  ilog.write(`Files deleted   : ${deletedSources.length}\n`)
+  ilog.write(`Chunks embedded : ${totalChunks}\n`)
+  ilog.write(`Total time      : ${fmtMs(Date.now() - ingestStart)}\n`)
+  ilog.close()
 }

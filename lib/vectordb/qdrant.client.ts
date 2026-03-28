@@ -18,6 +18,8 @@
 
 import { QdrantClient } from '@qdrant/js-client-rest'
 import { v5 as uuidv5 } from 'uuid'
+import pRetry, { AbortError } from 'p-retry'
+import { logger } from '../logger'
 import type { SparseVector } from '../rag/sparse-encoder'
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -183,7 +185,7 @@ async function ensureCollection() {
       },
     })
 
-    console.log(`Created Qdrant collection "${COLLECTION}" (dense dim=${VECTOR_SIZE} + sparse)`)
+    process.stdout.write(`Created Qdrant collection "${COLLECTION}" (dense dim=${VECTOR_SIZE} + sparse)\n`)
 
     await client.createPayloadIndex(COLLECTION, {
       field_name: 'metadata.source',
@@ -202,7 +204,7 @@ async function ensureCollection() {
       field_schema: 'keyword',
     })
 
-    console.log('Created payload indexes on metadata.source, metadata.docType')
+    process.stdout.write('Created payload indexes on metadata.source, metadata.docType\n')
   }
 
   collectionReady = true
@@ -211,28 +213,51 @@ async function ensureCollection() {
 // ─── Retry Helper ─────────────────────────────────────────────────────────────
 
 /**
- * PROD NOTE — This is minimal. Production retry should:
- *   - Distinguish retryable (503, timeout) from non-retryable (400 bad request)
- *   - Add jitter to avoid thundering herd on recovery
- *   - Report retries to metrics/alerting
- *   - Respect a global deadline across attempts
- * Use `p-retry` or `async-retry` in production.
+ * Returns true for HTTP 4xx errors — these are client errors (bad request,
+ * not found, unauthorized) that will not succeed on retry. We abort immediately
+ * so we don't waste retries on errors the server will always reject.
+ *
+ * The Qdrant REST client surfaces errors as plain Error objects whose message
+ * starts with the HTTP status code (e.g. "400 Bad Request").
  */
-async function withRetry<T>(fn: () => Promise<T>, retries = 3, delayMs = 500): Promise<T> {
-  let lastError: unknown
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      return await fn()
-    } catch (err) {
-      lastError = err
-      if (attempt < retries) {
-        const wait = delayMs * 2 ** (attempt - 1)
-        console.warn(`Qdrant attempt ${attempt} failed, retrying in ${wait}ms...`)
-        await new Promise((r) => setTimeout(r, wait))
+function isClientError(err: unknown): boolean {
+  return err instanceof Error && /^4\d\d\b/.test(err.message)
+}
+
+/**
+ * Retry a Qdrant operation with exponential backoff + jitter.
+ *
+ * - Retryable: 5xx, network errors, timeouts
+ * - Non-retryable (AbortError): 4xx — server will reject these regardless
+ * - Jitter (randomize: true): spreads retries so a thundering herd of requests
+ *   hitting a recovering Qdrant node don't all retry at the same instant
+ * - onFailedAttempt: logs each retry with attempt number and remaining retries
+ *   so slow degradation is visible in structured logs before the final failure
+ */
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  return pRetry(
+    async () => {
+      try {
+        return await fn()
+      } catch (err) {
+        if (isClientError(err)) throw new AbortError(err as Error)
+        throw err
       }
+    },
+    {
+      retries: 3,
+      minTimeout: 500,
+      randomize: true,
+      onFailedAttempt: (err) => {
+        logger.warn({
+          event: 'qdrant_retry',
+          attempt: err.attemptNumber,
+          retriesLeft: err.retriesLeft,
+          error: String(err),
+        })
+      },
     }
-  }
-  throw lastError
+  )
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -272,7 +297,7 @@ export async function upsertChunks(chunks: DocChunk[]): Promise<void> {
     })
   )
 
-  console.log(`Upserted ${chunks.length} chunks`)
+  // Batch upsert confirmed — individual batch logs suppressed to keep ingest output clean
 }
 
 /**
@@ -383,7 +408,7 @@ export async function deleteChunksBySource(source: string): Promise<void> {
     })
   )
 
-  console.log(`Deleted existing chunks for: ${source}`)
+  // Deletion confirmed — logged by the caller in the per-file progress line
 }
 
 /**
